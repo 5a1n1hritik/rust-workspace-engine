@@ -9,3 +9,4 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 regex = "1.10"
+miller_parser = { path = "../miller_parser" }

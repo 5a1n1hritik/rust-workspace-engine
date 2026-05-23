@@ -2,9 +2,13 @@ use std::fs;
 use std::process::Command;
 use std::io::{self, Write};
 use std::time::Duration;
+use std::path::Path;            // New import
 use reqwest::Client;
 use serde_json::json;
 use regex::Regex;
+
+// Use miller_parser function
+use miller_parser::ast_graph::build_ast_graph;
 
 const OLLAMA_URL: &str = "http://localhost:11434/api/generate";
 const MODEL_NAME: &str = "qwen2.5-coder:3b";
@@ -112,6 +116,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("{}", stdout);
                     println!("--------------");
                     
+                    // 👁️ 👁️ 👁️ NEW: EYE OF MILLER (AST PARSER GRAPH INTERACTIVE VIEW) 👁️ 👁️ 👁️
+                    println!("\n[Miller Parser] Analysing Generated Code Structure...");
+                    let path = Path::new(TARGET_FILE);
+                    let nodes = build_ast_graph(path);
+                    
+                    println!("\n========== LIVE AST CODE GRAPH ==========");
+                    if nodes.is_empty() {
+                        println!("No structural functions or structs detected.");
+                    } else {
+                        for node in nodes {
+                            println!("📍 Type: [{}] | Name: {}", node.entity_type.to_uppercase(), node.entity_name);
+                            if !node.dependencies.is_empty() {
+                                println!("   └── Calls: {:?}", node.dependencies);
+                            }
+                        }
+                    }
+                    println!("=========================================");
+
                     // Cleanup binaries
                     let _ = fs::remove_file("sandbox_exec");
                     break;
