@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "miller_core",
+    "miller_parser",
+    "miller_memory",
+]
+resolver = "2"
