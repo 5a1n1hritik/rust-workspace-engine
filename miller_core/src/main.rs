@@ -2,16 +2,19 @@ use std::fs;
 use std::process::Command;
 use std::io::{self, Write};
 use std::time::Duration;
-use std::path::Path;            // New import
+use std::path::Path;
 use reqwest::Client;
 use serde_json::json;
 use regex::Regex;
 
 // Use miller_parser function
 use miller_parser::ast_graph::build_ast_graph;
+use miller_memory::{MillerMemory, MemoryPayload};
 
 const OLLAMA_URL: &str = "http://localhost:11434/api/generate";
+const EMBED_URL: &str = "http://localhost:11434/api/embeddings";
 const MODEL_NAME: &str = "qwen2.5-coder:3b";
+const EMBED_MODEL: &str = "all-minilm"; // Fixed lightweight 384-dim embedding model
 const TARGET_FILE: &str = "sandbox.rs";
 const EXEC_NAME: &str = "./sandbox_exec";
 
@@ -35,8 +38,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .timeout(Duration::from_secs(120))
         .pool_idle_timeout(Duration::from_secs(30))
         .build()?;
-    
-    println!("=== MILLER: Production-Grade Autonomous Engine ===");
+
+
+    // Initialize Local Qdrant Memory Layer
+    let memory_layer = MillerMemory::new();
+    memory_layer.init_collection().await?;
+
+    println!("=== MILLER: Fully Autonomous Engine ===");
     print!("\nMiller ko task batao:\n> ");
     io::stdout().flush()?;
     
@@ -45,10 +53,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let original_task = original_task.trim();
     
     // Initial System Prompt
+    // let mut current_prompt = format!(
+        // "You are Miller, a world-class systems engineer writing pure Rust code. \
+        // You must provide the complete code strictly inside [CODE_START] and [CODE_END] tags. \
+        // Do NOT write markdown code blocks like ```rust. Just raw text inside tags.\n\
+        // Task: {}", 
+        // original_task
+    // );
     let mut current_prompt = format!(
-        "You are Miller, a world-class systems engineer writing pure Rust code. \
-        You must provide the complete code strictly inside [CODE_START] and [CODE_END] tags. \
-        Do NOT write markdown code blocks like ```rust. Just raw text inside tags.\n\
+        "You are Miller, an expert Rust engineer. Return ONLY the executable Rust code requested.\n\
+        You MUST wrap the code inside a standard markdown code block like this:\n\
+        ```rust\n\
+        // code here\n\
+        ```\n\
+        Do not include any introductory or concluding text.\n\
         Task: {}", 
         original_task
     );
@@ -125,7 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if nodes.is_empty() {
                         println!("No structural functions or structs detected.");
                     } else {
-                        for node in nodes {
+                        for node in &nodes {
                             println!("📍 Type: [{}] | Name: {}", node.entity_type.to_uppercase(), node.entity_name);
                             if !node.dependencies.is_empty() {
                                 println!("   └── Calls: {:?}", node.dependencies);
@@ -133,9 +151,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     println!("=========================================");
+                    
+                    // Embedding and Ingestion into Local Vector DB
+                    println!("[Memory] Converting code chunks to vectors via Ollama...");
+                    let mut pseudo_id = 1; // Basic unique ID mapping inside DB
+                    
+                    for node in &nodes {
+                        // Get Vector from Ollama
+                        if let Ok(vector) = get_ollama_embedding(&client, &node.content).await {
+                            let payload = MemoryPayload {
+                                file_path: node.file_path.clone(),
+                                entity_name: node.entity_name.clone(),
+                                entity_type: node.entity_type.clone(),
+                                content: node.content.clone(),
+                            };
 
+                            // Upsert inside Local Qdrant Container
+                            if let Ok(_) = memory_layer.upsert_code_chunk(pseudo_id, vector, payload).await {
+                                println!("Stored [{}] '{}' safely inside Qdrant Database.", node.entity_type.to_uppercase(), node.entity_name);
+                                pseudo_id += 1;
+                            }
+                        }
+                    }
+                
                     // Cleanup binaries
                     let _ = fs::remove_file("sandbox_exec");
+                    println!("\n🚀 Milestone Completed! Memory database synced. View your Qdrant Dashboard at http://localhost:6333/dashboard");
                     break;
                 }
                 Err(stderr) => {
@@ -169,18 +210,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// === NEW INTER-MODULE OLLAMA VECTOR ENGINE ===
+async fn get_ollama_embedding(client: &Client, text: &str) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+    let response = client.post(EMBED_URL)
+        .json(&json!({ "model": EMBED_MODEL, "prompt": text }))
+        .send().await?
+        .json::<serde_json::Value>().await?;
+    
+    if let Some(embedding_array) = response["embedding"].as_array() {
+        let vector: Vec<f64> = embedding_array.iter().map(|v| v.as_f64().unwrap_or(0.0)).collect();
+        Ok(vector)
+    } else {
+        Err("Failed to extract valid embedding vectors from Ollama".into())
+    }
+}
+
 // ================= ARCHITECTURAL FUNCTIONS =================
 
 /// 🎯 1. Strict Sanitizer: Fails early, no dangerous fallbacks.
-fn sanitize_code(raw: &str) -> Option<String> {
-    let re = Regex::new(r"(?si)\[CODE_START\](.*?)\[CODE_END\]").ok()?;
-    let captures = re.captures(raw)?;
-    let mut code = captures.get(1)?.as_str().trim().to_string();
+// fn sanitize_code(raw: &str) -> Option<String> {
+//    let re = Regex::new(r"(?si)\[CODE_START\](.*?)\[CODE_END\]").ok()?;
+//    let captures = re.captures(raw)?;
+//    let mut code = captures.get(1)?.as_str().trim().to_string();
+//
+//    // Remove rogue markdown fences if any nested inside tags
+//    code = code.replace("
+// ```rust", "");
+//    code = code.replace("```", "");
+//    code = code.replace("\r\n", "\n");
 
-    // Remove rogue markdown fences if any nested inside tags
-    code = code.replace("
-```rust", "");
-    code = code.replace("```", "");
+//    if code.trim().is_empty() {
+//        return None;
+//    }
+//    Some(code.trim().to_string())
+// }
+
+fn sanitize_code(raw: &str) -> Option<String> {
+    // 3B model standard markdown fences use karega, hum use hi capture karenge
+    let re = Regex::new(r"(?s)```rust(.*?)```").ok()?;
+    
+    let mut code = if let Some(captures) = re.captures(raw) {
+        captures.get(1)?.as_str().trim().to_string()
+    } else {
+        // Fallback: Agar bina language tag ke sirf ``` diya ho
+        let re_fallback = Regex::new(r"(?s)```(.*?)```").ok()?;
+        if let Some(captures) = re_fallback.captures(raw) {
+            captures.get(1)?.as_str().trim().to_string()
+        } else {
+            return None;
+        }
+    };
+
     code = code.replace("\r\n", "\n");
 
     if code.trim().is_empty() {
