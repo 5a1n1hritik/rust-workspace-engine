@@ -44,13 +44,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let memory_layer = MillerMemory::new();
     memory_layer.init_collection().await?;
 
-    println!("=== MILLER: Fully Autonomous Engine ===");
+    println!("\n=== MILLER: Fully Autonomous Engine (Retrieval Active) ===");
     print!("\nMiller ko task batao:\n> ");
     io::stdout().flush()?;
     
     let mut original_task = String::new();
     io::stdin().read_line(&mut original_task)?;
     let original_task = original_task.trim();
+
+    // 🧠 1. RETRIEVING CONTEXT FROM YAADDASHT (MEMORY)
+    println!("[Retrieval] Searching past code patterns from local Qdrant DB...");
+    let mut context_code_str = String::new();
+    
+    // User ke prompt ka query embedding generate karo
+    if let Ok(query_vector) = get_ollama_embedding(&client, original_task).await {
+        // Qdrant DB se top 2 sabse matching code chunks nikal lo
+        if let Ok(matched_chunks) = memory_layer.search_similar_code(query_vector, 2).await {
+            if !matched_chunks.is_empty() {
+                println!("🎯 [Retrieval Match] Found relevant past context in memory!");
+                context_code_str.push_str("\n--- RELEVANT EXISTING CONTEXT CODE ---\n");
+                for chunk in matched_chunks {
+                    println!("   -> Found {} in '{}'", chunk.entity_name, chunk.file_path);
+                    context_code_str.push_str(&format!(
+                        "// From File: {}\n// Entity: {}\n{}\n\n",
+                        chunk.file_path, chunk.entity_name, chunk.content
+                    ));
+                }
+                context_code_str.push_str("---------------------------------------\n");
+            } else {
+                println!("🔍 [Retrieval] No matching past context found. Proceeding raw.");
+            }
+        }
+    }
     
     // Initial System Prompt
     // let mut current_prompt = format!(
@@ -67,7 +92,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // code here\n\
         ```\n\
         Do not include any introductory or concluding text.\n\
-        Task: {}", 
+        {}\n\
+        Task: {}",
+        context_code_str, // yeh purana matching code prompt mein inject ho gya! 
         original_task
     );
 
@@ -154,7 +181,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     
                     // Embedding and Ingestion into Local Vector DB
                     println!("[Memory] Converting code chunks to vectors via Ollama...");
-                    let mut pseudo_id = 1; // Basic unique ID mapping inside DB
+                    let mut pseudo_id = std::time::SystemTime::now().duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap().as_secs();  // unique ID mapping inside DB
                     
                     for node in &nodes {
                         // Get Vector from Ollama
