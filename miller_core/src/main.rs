@@ -64,12 +64,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let mut pseudo_id = std::time::SystemTime::now().duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap().as_secs();
 
             for (idx, chunk) in changed_nodes.iter().enumerate() {
-                if let Ok(vector) = get_ollama_embedding(&bg_client, &chunk.content).await {
+                if let Ok(vector) = get_ollama_embedding(&bg_client, &chunk.source_code).await {
                     let payload = MemoryPayload {
-                        file_path: chunk.file_path.clone(),
+                        file_path: bg_path.to_string_lossy().into_owned(),
                         entity_name: chunk.entity_name.clone(),
                         entity_type: chunk.entity_type.clone(),
-                        content: chunk.content.clone(),
+                        content: chunk.source_code.clone(),
                     };
                     if let Ok(_) = bg_memory.upsert_code_chunk(pseudo_id, vector, payload).await { pseudo_id += 1; }
                 }

@@ -3,14 +3,18 @@ use std::fs;
 use std::path::Path;
 use tree_sitter::{Parser, Query, QueryCursor};
 use serde::{Serialize, Deserialize};
+use sha2::{Sha256, Digest};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeNode {
     pub file_path: String,
+    pub entity_type: String,       // "struct", "function", ya "enum"
     pub entity_name: String,
-    pub entity_type: String, // "struct" ya "function"
-    pub content: String,
-    pub dependencies: Vec<String>, // Yeh function kis dusre function ko call kar raha hai (Graph Edges)
+    pub source_code: String,
+    pub dependencies: Vec<String>, // That function call another function (Graph Edges)
+    pub start_line: usize,         // Geometry start
+    pub end_line: usize,           // Geometry end
+    pub hash: String,              // Content-level signature hash
 }
 
 pub fn build_ast_graph(file_path: &Path) -> Vec<CodeNode> {
@@ -100,12 +104,27 @@ pub fn build_ast_graph(file_path: &Path) -> Vec<CodeNode> {
             }
         }
 
+        // Geometry extraction (Tree-sitter row index 0-based hota hai, isliye +1 kiya)
+        let (start_line, end_line) = if let Some(tn) = target_node {
+            (tn.start_position().row + 1, tn.end_position().row + 1)
+        } else {
+            (0, 0)
+        };
+
+        // Entity level SHA-256 generation
+        let mut hasher = Sha256::new();
+        hasher.update(content.as_bytes());
+        let entity_hash = format!("{:x}", hasher.finalize());
+
         graph_nodes.push(CodeNode {
             file_path: file_path.to_string_lossy().into_owned(),
             entity_name,
             entity_type: entity_type.to_string(),
-            content,
+            source_code: content,
             dependencies: dependencies.into_iter().collect(),
+            start_line,
+            end_line,
+            hash: entity_hash,
         });
     }
 

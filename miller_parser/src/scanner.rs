@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use sha2::{Sha256, Digest};
 use serde::{Serialize, Deserialize};
 
-// Humare padosi file `ast_graph.rs` se build function aur struct ko import kar rahe hain
 use crate::ast_graph::{build_ast_graph, CodeNode}; 
 
 const CACHE_FILE_NAME: &str = ".miller_cache.json";
@@ -69,36 +68,6 @@ pub fn scan_and_parse_project_incremental(root_path: &Path) -> (Vec<CodeNode>, u
     let mut total_files_checked = 0;
     let mut files_skipped = 0;
 
-    // let mut global_project_nodes = Vec::new();
-
-    // println!("[Miller Parser] Initiating deep scan for directory: {:?}", root_path);
-
-    // // WalkDir initialization with ignore filter
-    // let walker = WalkDir::new(root_path)
-    //     .into_iter()
-    //     .filter_entry(|e| !is_hidden_or_ignored(e));
-
-    // for entry in walker.filter_map(|e| e.ok()) {
-    //     let path = entry.path();
-        
-    //     // Abhi ke liye hum sirf Rust (.rs) files ko filter kar rahe hain.
-	// // Future me Python/TS ke liye yahan `&&` condition extend kar sakte hain.
-    //     if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("rs") {
-    //         // Hamari main scanner binary ya temporary files ko skip karo optimization ke liye
-    //         if path.file_name().and_then(|s| s.to_str()) == Some("sandbox.rs") {
-    //             continue;
-    //         }
-
-    //         println!("[Miller Parser] Extracting AST from: {:?}", path);
-    //         let mut file_nodes = build_ast_graph(path);
-    //         global_project_nodes.append(&mut file_nodes);
-    //     }
-    // }
-
-    // println!("[Miller Parser] Scan Complete. Total Entities Extracted: {}", global_project_nodes.len());
-    // global_project_nodes
-
-
     println!("[Miller Parser] Incremental background indexing scanner chalu ho raha hai...");
 
     let current_cache = load_cache(root_path);
@@ -131,7 +100,7 @@ pub fn scan_and_parse_project_incremental(root_path: &Path) -> (Vec<CodeNode>, u
                     
                     let current_hash = calculate_sha256(&content);
 
-                    // 🔍 Core Delta check algorithm
+                    // Core Delta check algorithm
                     let mut needs_reindex = true;
                     if let Some(cached_file) = current_cache.files.get(&file_path_str) {
                         if cached_file.sha256_hash == current_hash && cached_file.last_modified == modified_time {
@@ -140,7 +109,7 @@ pub fn scan_and_parse_project_incremental(root_path: &Path) -> (Vec<CodeNode>, u
                     }
 
                     if needs_reindex {
-                        println!("[Miller Parser] 🔄 Nayi file ya badlao mila. Code extract ho raha hai: {:?}", path);
+                        println!("[Miller Parser] Nayi file ya badlao mila. Code extract ho raha hai: {:?}", path);
                         let mut file_nodes = build_ast_graph(path);
                         changed_nodes.append(&mut file_nodes);
                     } else {
