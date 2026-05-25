@@ -2,13 +2,13 @@ use std::fs;
 use std::process::Command;
 use std::io::{self, Write};
 use std::time::Duration;
-use std::path::Path;
+use std::path::PathBuf;
 use reqwest::Client;
 use serde_json::json;
 use regex::Regex;
 
 // Use miller_parser function
-use miller_parser::ast_graph::build_ast_graph;
+use miller_parser::scanner::scan_and_parse_project_incremental;
 use miller_memory::{MillerMemory, MemoryPayload};
 
 const OLLAMA_URL: &str = "http://localhost:11434/api/generate";
@@ -18,7 +18,7 @@ const EMBED_MODEL: &str = "all-minilm"; // Fixed lightweight 384-dim embedding m
 const TARGET_FILE: &str = "sandbox.rs";
 const EXEC_NAME: &str = "./sandbox_exec";
 
-// 🔒 Security: Stochastic parrot ko root access nahi dena hai!
+// Security: Stochastic parrot ko root access nahi dena hai!
 const BLOCKED_PATTERNS: &[&str] = &[
     "remove_dir_all",
     "std::fs::remove_dir",
@@ -32,8 +32,8 @@ const BLOCKED_PATTERNS: &[&str] = &[
 ];
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // ⚙️ Production HTTP Client: Defend against freezes and timeouts
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Production HTTP Client: Defend against freezes and timeouts
     let client = Client::builder()
         .timeout(Duration::from_secs(120))
         .pool_idle_timeout(Duration::from_secs(30))
@@ -44,7 +44,115 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let memory_layer = MillerMemory::new();
     memory_layer.init_collection().await?;
 
-    println!("\n=== MILLER: Fully Autonomous Engine (Retrieval Active) ===");
+    println!("=== MILLER: Local Autonomous Coding Framework ===");
+    
+    let args: Vec<String> = std::env::args().collect();
+    let mut target_project_path: Option<PathBuf> = None;
+    
+    if args.len() > 1 {
+        let path = PathBuf::from(&args[1]);
+        if path.exists() {
+            println!("[System] External project path loaded: {:?}", path);
+            target_project_path = Some(path);
+        } else {
+            println!("[Error] Path exist nahi karta: {:?}", path);
+            return Ok(());
+        }
+    } else {
+        println!("[System] No external workspace attached. Background scanner is Idle.");
+    }
+
+    // TOKIO ASYNC BACKGROUND SCANNER RUN (The Cursor Way)
+    if let Some(bg_path) = target_project_path {
+        let bg_client = client.clone();
+        // let bg_path = target_project_path.clone();
+        
+        tokio::task::spawn(async move {
+            println!("\n[Background Worker] Silent monitoring loop active: {:?}", bg_path);
+
+            let scan_result = tokio::task::spawn_blocking(move || {
+                scan_and_parse_project_incremental(&bg_path)
+            })
+            .await;
+
+            let (changed_nodes, skipped_count) = match scan_result {
+                Ok(result) => result,
+                Err(e) => {
+                    eprintln!("[Background Worker] Scanner thread crashed: {}", e);
+                    return;
+                }
+            };
+            
+            if skipped_count > 0 {
+                println!("[Background Worker] Fast skip operational: {} files unchanged.", skipped_count);
+            }
+
+            if changed_nodes.is_empty() {
+                println!(
+                    "\n[Background Worker] Cache clean. Total code memory state is fully synchronous."
+                );
+                return;
+            }
+
+            println!(
+                "[Background Worker] Syncing {} modified items into local Qdrant...",
+                changed_nodes.len()
+            );
+
+            let bg_memory = MillerMemory::new();
+
+            let mut pseudo_id = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            const BATCH_SIZE: usize = 30;
+
+            for (idx, chunk) in changed_nodes.iter().enumerate() {
+                match get_ollama_embedding(&bg_client, &chunk.content).await {
+                    Ok(vector) => {
+                        let payload = MemoryPayload {
+                            file_path: chunk.file_path.clone(),
+                            entity_name: chunk.entity_name.clone(),
+                            entity_type: chunk.entity_type.clone(),
+                            content: chunk.content.clone(),
+                        };
+
+                        match bg_memory
+                            .upsert_code_chunk(pseudo_id, vector, payload)
+                            .await
+                        {
+                            Ok(_) => {
+                                pseudo_id += 1;
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[Background Worker] Failed to store vector chunk: {}",
+                                    e
+                                );
+                            }
+                        }
+                    }
+
+                    Err(e) => {
+                        eprintln!(
+                            "[Background Worker] Embedding generation failed: {}",
+                            e
+                        );
+                    }
+                }
+
+                if (idx + 1) % BATCH_SIZE == 0 {
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                }
+            }
+
+            println!(
+                "\n[Background Worker] Vector embedding database sync cycle completed!"
+            );
+        });
+    }
+
     print!("\nMiller ko task batao:\n> ");
     io::stdout().flush()?;
     
@@ -52,7 +160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     io::stdin().read_line(&mut original_task)?;
     let original_task = original_task.trim();
 
-    // 🧠 1. RETRIEVING CONTEXT FROM YAADDASHT (MEMORY)
+    // RETRIEVING CONTEXT FROM MEMORY (DATABASE) BASED ON THE USER TASK
     println!("[Retrieval] Searching past code patterns from local Qdrant DB...");
     let mut context_code_str = String::new();
     
@@ -61,9 +169,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Qdrant DB se top 2 sabse matching code chunks nikal lo
         if let Ok(matched_chunks) = memory_layer.search_similar_code(query_vector, 2).await {
             if !matched_chunks.is_empty() {
-                println!("🎯 [Retrieval Match] Found relevant past context in memory!");
+                println!("[Retrieval Match] Valid structural matches found. Injecting code context memory blocks...");
                 context_code_str.push_str("\n--- RELEVANT EXISTING CONTEXT CODE ---\n");
                 for chunk in matched_chunks {
+                    if chunk.file_path.contains("miller_core") || chunk.file_path.contains("miller_parser") {
+                        continue;
+                    }
                     println!("   -> Found {} in '{}'", chunk.entity_name, chunk.file_path);
                     context_code_str.push_str(&format!(
                         "// From File: {}\n// Entity: {}\n{}\n\n",
@@ -72,19 +183,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 context_code_str.push_str("---------------------------------------\n");
             } else {
-                println!("🔍 [Retrieval] No matching past context found. Proceeding raw.");
+                println!("[Retrieval] Database configuration direct zero hits. Initializing safe baseline creation...");
             }
         }
     }
     
-    // Initial System Prompt
+    // Initial System Prompt that prompt for ollama 7b module
     // let mut current_prompt = format!(
-        // "You are Miller, a world-class systems engineer writing pure Rust code. \
-        // You must provide the complete code strictly inside [CODE_START] and [CODE_END] tags. \
-        // Do NOT write markdown code blocks like ```rust. Just raw text inside tags.\n\
-        // Task: {}", 
-        // original_task
+    //     "You are Miller, a world-class systems engineer writing pure Rust code. \
+    //     You must provide the complete code strictly inside [CODE_START] and [CODE_END] tags. \
+    //     Do NOT write markdown code blocks like ```rust. Just raw text inside tags.\n\
+    //     Task: {}", 
+    //     original_task
     // );
+
+    // that prompt for ollama 3b module.
     let mut current_prompt = format!(
         "You are Miller, an expert Rust engineer. Return ONLY the executable Rust code requested.\n\
         You MUST wrap the code inside a standard markdown code block like this:\n\
@@ -94,7 +207,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Do not include any introductory or concluding text.\n\
         {}\n\
         Task: {}",
-        context_code_str, // yeh purana matching code prompt mein inject ho gya! 
+        context_code_str, // inject old matching code in prompt!
         original_task
     );
 
@@ -105,31 +218,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         attempts += 1;
         println!("\n[Miller] Generating code (Attempt {}/{})...", attempts, MAX_ATTEMPTS);
         
-        // 🚀 2. Robust Request Layer with internal timeout handling
+        // Robust Request Layer with internal timeout handling
         let ai_response = match generate_with_retry(&client, &current_prompt).await {
             Ok(text) => text,
             Err(e) => {
-                println!("❌ [Network Error] Ollama call permanently failed: {}", e);
+                println!("[Network Error] Ollama call permanently failed: {}", e);
                 break;
             }
         };
 
-        // 🎯 1. Strict Extraction & Sanitization Layer
+        // Strict Extraction & Sanitization Layer
         let code_to_write = match sanitize_code(&ai_response) {
             Some(code) => code,
             None => {
-                println!("⚠️ [Sanitizer] Failed to extract clean code from tags. Regenerating...");
+                println!("[Sanitizer] Code structure standard block not captured. Re-prompt alignment structural fix active...");
                 current_prompt = format!(
-                    "Your previous response did not contain the strict [CODE_START] and [CODE_END] tags. \
+                    "Your previous response did not contain standard markdown code fences \
                     Please regenerate the full code and wrap it properly.\nTask: {}", original_task
                 );
                 continue;
             }
         };
 
-        // 🔒 6. Security Scanner Layer
+        // Security Scanner Layer
         if !is_safe(&code_to_write) {
-            println!("🚨 [Security Breach] Generated code contains malicious or blocked patterns! Aborting block.");
+            println!("[Security Breach] Dangerous instruction sequence intercepted! Task terminated.");
             println!("----------------------------------------\n{}\n----------------------------------------", code_to_write);
             current_prompt = format!(
                 "CRITICAL: The code you generated failed our security scan due to blocked system calls (e.g., unsafe, Command, remove_dir_all). \
@@ -138,11 +251,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        // 📝 Safe to write now
+        // Safe to write now
         fs::write(TARGET_FILE, &code_to_write)?;
-        println!("[Filesystem] Code safely written to '{}'", TARGET_FILE);
+        println!("[Filesystem] Code successfully flushed into sandbox storage file: '{}'", TARGET_FILE);
 
-        // 🛠️ 3. Compilation Validation Layer
+        // Compilation Validation Layer
         println!("[Compiler] Running rustc validation...");
         let compile_output = Command::new("rustc")
             .arg(TARGET_FILE)
@@ -151,68 +264,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .output()?;
 
         if compile_output.status.success() {
-            println!("🎉 [Success] Code compiled successfully! Moving to Execution Sandbox...");
+            println!("[Success] Code compiled successfully! Moving to Execution Sandbox...");
             
-            // 🏃‍♂️ 5. Execution Sandbox & Behavioral Validation
+            // Execution Sandbox & Behavioral Validation
             match run_sandbox_execution() {
                 Ok(stdout) => {
-                    println!("\n🚀 [Sandbox Execution Pass]");
+                    println!("\n[Sandbox Execution Pass]");
                     println!("--- STDOUT ---");
                     println!("{}", stdout);
                     println!("--------------");
-                    
-                    // 👁️ 👁️ 👁️ NEW: EYE OF MILLER (AST PARSER GRAPH INTERACTIVE VIEW) 👁️ 👁️ 👁️
-                    println!("\n[Miller Parser] Analysing Generated Code Structure...");
-                    let path = Path::new(TARGET_FILE);
-                    let nodes = build_ast_graph(path);
-                    
-                    println!("\n========== LIVE AST CODE GRAPH ==========");
-                    if nodes.is_empty() {
-                        println!("No structural functions or structs detected.");
-                    } else {
-                        for node in &nodes {
-                            println!("📍 Type: [{}] | Name: {}", node.entity_type.to_uppercase(), node.entity_name);
-                            if !node.dependencies.is_empty() {
-                                println!("   └── Calls: {:?}", node.dependencies);
-                            }
-                        }
-                    }
-                    println!("=========================================");
-                    
-                    // Embedding and Ingestion into Local Vector DB
-                    println!("[Memory] Converting code chunks to vectors via Ollama...");
-                    let mut pseudo_id = std::time::SystemTime::now().duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap().as_secs();  // unique ID mapping inside DB
-                    
-                    for node in &nodes {
-                        // Get Vector from Ollama
-                        if let Ok(vector) = get_ollama_embedding(&client, &node.content).await {
-                            let payload = MemoryPayload {
-                                file_path: node.file_path.clone(),
-                                entity_name: node.entity_name.clone(),
-                                entity_type: node.entity_type.clone(),
-                                content: node.content.clone(),
-                            };
 
-                            // Upsert inside Local Qdrant Container
-                            if let Ok(_) = memory_layer.upsert_code_chunk(pseudo_id, vector, payload).await {
-                                println!("Stored [{}] '{}' safely inside Qdrant Database.", node.entity_type.to_uppercase(), node.entity_name);
-                                pseudo_id += 1;
-                            }
-                        }
-                    }
-                
                     // Cleanup binaries
                     let _ = fs::remove_file("sandbox_exec");
-                    println!("\n🚀 Milestone Completed! Memory database synced. View your Qdrant Dashboard at http://localhost:6333/dashboard");
+                    println!("\nProcessing Loop Cycle Ended Successfully.");
                     break;
                 }
                 Err(stderr) => {
-                    println!("\n❌ [Sandbox Runtime Error] Code compiled but failed during execution.");
+                    println!("\n[Sandbox Runtime Error] Executable container crash or execution failure.");
                     println!("--- STDERR ---");
                     println!("{}", stderr);
                     println!("--------------");
                     
-                    // 🔄 4. Stateless Repair Prompt
+                    // Stateless Repair Prompt
                     current_prompt = build_repair_prompt(original_task, &code_to_write, &stderr, "Runtime/Execution Error");
                 }
             }
@@ -221,11 +294,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let raw_stderr = String::from_utf8_lossy(&compile_output.stderr);
             let clean_error = extract_compiler_error(&raw_stderr);
             
-            println!("\n❌ [Compile Error] Found syntax or type errors!");
+            println!("\n[Compile Error] Logic failure details captured.");
             println!("------------------- CLEAN ERROR -------------------\n{}", clean_error);
             println!("---------------------------------------------------");
 
-            // 🔄 4. Stateless Repair Prompt
+            // Stateless Repair Prompt
             current_prompt = build_repair_prompt(original_task, &code_to_write, &clean_error, "Compilation Error");
         }
     }
@@ -237,40 +310,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// === NEW INTER-MODULE OLLAMA VECTOR ENGINE ===
-async fn get_ollama_embedding(client: &Client, text: &str) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+// === INTER-MODULE OLLAMA VECTOR ENGINE ===
+async fn get_ollama_embedding(
+    client: &Client,
+    text: &str
+) -> Result<Vec<f64>, Box<dyn std::error::Error + Send + Sync>> {
+    // SAFE TRUNCATION: slice to maximum 500 characters to prevent Ollama context length overflow
+    let safe_text = if text.len() > 500 {
+        match text.char_indices().nth(500) {
+            Some((idx, _)) => &text[..idx],
+            None => text,
+        }
+    } else {
+        text
+    };
+
     let response = client.post(EMBED_URL)
-        .json(&json!({ "model": EMBED_MODEL, "prompt": text }))
-        .send().await?
-        .json::<serde_json::Value>().await?;
+        .json(&json!({ "model": EMBED_MODEL, "prompt": safe_text }))
+        .send().await?;
+
+    let json_val: serde_json::Value = response.json().await?;
+
+    // Agar Ollama koi explicit error bhej raha hai:
+    if let Some(err) = json_val.get("error") {
+        eprintln!("[Ollama Debug] Ollama returned error: {:?}", err);
+    }
     
-    if let Some(embedding_array) = response["embedding"].as_array() {
+    if let Some(embedding_array) = json_val["embedding"].as_array() {
         let vector: Vec<f64> = embedding_array.iter().map(|v| v.as_f64().unwrap_or(0.0)).collect();
         Ok(vector)
     } else {
+        // Agar format badal gaya hai toh pure response ke keys check karein
+        eprintln!("[Ollama Debug] Unexpected JSON format: {:?}", json_val);
         Err("Failed to extract valid embedding vectors from Ollama".into())
     }
 }
 
 // ================= ARCHITECTURAL FUNCTIONS =================
-
-/// 🎯 1. Strict Sanitizer: Fails early, no dangerous fallbacks.
-// fn sanitize_code(raw: &str) -> Option<String> {
-//    let re = Regex::new(r"(?si)\[CODE_START\](.*?)\[CODE_END\]").ok()?;
-//    let captures = re.captures(raw)?;
-//    let mut code = captures.get(1)?.as_str().trim().to_string();
-//
-//    // Remove rogue markdown fences if any nested inside tags
-//    code = code.replace("
-// ```rust", "");
-//    code = code.replace("```", "");
-//    code = code.replace("\r\n", "\n");
-
-//    if code.trim().is_empty() {
-//        return None;
-//    }
-//    Some(code.trim().to_string())
-// }
 
 fn sanitize_code(raw: &str) -> Option<String> {
     // 3B model standard markdown fences use karega, hum use hi capture karenge
@@ -296,8 +372,11 @@ fn sanitize_code(raw: &str) -> Option<String> {
     Some(code.trim().to_string())
 }
 
-/// 🚀 2. Robust Client with internal retry logic for Unstable Local LLMs
-async fn generate_with_retry(client: &Client, prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+/// Robust Client with internal retry logic for Unstable Local LLMs
+async fn generate_with_retry(
+    client: &Client,
+    prompt: &str
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     const MAX_RETRIES: usize = 3;
     for attempt in 1..=MAX_RETRIES {
         let response = client.post(OLLAMA_URL)
@@ -327,7 +406,7 @@ async fn generate_with_retry(client: &Client, prompt: &str) -> Result<String, Bo
     Err("Ollama connections permanently dropped.".into())
 }
 
-/// 🔍 3. Error Extractor: Deletes unicode garbage, filters only core rustc notes
+/// Error Extractor: Deletes unicode garbage, filters only core rustc notes
 fn extract_compiler_error(stderr: &str) -> String {
     stderr.lines()
         .filter(|line| {
@@ -341,7 +420,7 @@ fn extract_compiler_error(stderr: &str) -> String {
         .join("\n")
 }
 
-/// 🔄 4. Stateless Repair Prompt Builder: Prevents infinite toxic context bloating
+/// Stateless Repair Prompt Builder: Prevents infinite toxic context bloating
 fn build_repair_prompt(original_task: &str, broken_code: &str, error_log: &str, error_type: &str) -> String {
     format!(
 r#"You are an expert systems engineer. The previous Rust code you generated failed during {}.
@@ -362,7 +441,7 @@ Fix the issue completely. Return the ENTIRE updated Rust code strictly inside [C
     )
 }
 
-/// 🏃‍♂️ 5. Execution Sandbox: Validates behavioral correctness beyond just compilation
+/// Execution Sandbox: Validates behavioral correctness beyond just compilation
 fn run_sandbox_execution() -> Result<String, String> {
     let output = match Command::new(EXEC_NAME).output() {
         Ok(out) => out,
@@ -376,7 +455,7 @@ fn run_sandbox_execution() -> Result<String, String> {
     }
 }
 
-/// 🔒 6. Security Guardrail
+/// Security Guardrail
 fn is_safe(code: &str) -> bool {
     !BLOCKED_PATTERNS.iter().any(|pattern| code.contains(pattern))
 }

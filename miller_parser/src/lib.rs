@@ -1,4 +1,5 @@
 pub mod ast_graph;
+pub mod scanner;
 
 #[cfg(test)]
 mod tests {

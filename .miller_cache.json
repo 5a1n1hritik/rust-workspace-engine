@@ -1,0 +1,29 @@
+{
+  "files": {
+    "/home/hritik/Documents/workspace-p/miller_workspace/miller_parser/src/ast_graph.rs": {
+      "file_path": "/home/hritik/Documents/workspace-p/miller_workspace/miller_parser/src/ast_graph.rs",
+      "sha256_hash": "840987cfba969077e90517a24cb7a424be181ec590d915ee62e2308c35690d99",
+      "last_modified": 1779617311
+    },
+    "/home/hritik/Documents/workspace-p/miller_workspace/miller_parser/src/scanner.rs": {
+      "file_path": "/home/hritik/Documents/workspace-p/miller_workspace/miller_parser/src/scanner.rs",
+      "sha256_hash": "aa6092cf089fcf982920c46ddb458690124db6f636636fdc6575459788915dd2",
+      "last_modified": 1779687130
+    },
+    "/home/hritik/Documents/workspace-p/miller_workspace/miller_parser/src/lib.rs": {
+      "file_path": "/home/hritik/Documents/workspace-p/miller_workspace/miller_parser/src/lib.rs",
+      "sha256_hash": "4df14365b6ea132bff20d5d472048e638f55184c92ad4dd35a223693c9d1f44e",
+      "last_modified": 1779612072
+    },
+    "/home/hritik/Documents/workspace-p/miller_workspace/miller_memory/src/lib.rs": {
+      "file_path": "/home/hritik/Documents/workspace-p/miller_workspace/miller_memory/src/lib.rs",
+      "sha256_hash": "c23c43a548f105e157b5d345ea31faa2ce64a4af8c1450325c6e7c2711dfb2ce",
+      "last_modified": 1779689249
+    },
+    "/home/hritik/Documents/workspace-p/miller_workspace/miller_core/src/main.rs": {
+      "file_path": "/home/hritik/Documents/workspace-p/miller_workspace/miller_core/src/main.rs",
+      "sha256_hash": "7320b327d5d57dd13220649fde4c04125f9a726cea5c5954d3ddfd26fe2fa948",
+      "last_modified": 1779693676
+    }
+  }
+}

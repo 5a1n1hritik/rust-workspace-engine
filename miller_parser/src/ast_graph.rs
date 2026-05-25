@@ -24,10 +24,11 @@ pub fn build_ast_graph(file_path: &Path) -> Vec<CodeNode> {
     let tree = parser.parse(&source_code, None).expect("AST Tree parse nahi hua");
     let root_node = tree.root_node();
 
-    // Query 1: Structs aur Functions ko extract karne ke liye
+    // Query
     let entity_query_str = "
         (function_item name: (identifier) @fn.name) @fn.body
         (struct_item name: (type_identifier) @struct.name) @struct.body
+        (enum_item name: (type_identifier) @enum.name) @enum.body
     ";
     
     let entity_query = Query::new(language, entity_query_str).unwrap();
@@ -63,8 +64,20 @@ pub fn build_ast_graph(file_path: &Path) -> Vec<CodeNode> {
                     content = text;
                     target_node = Some(capture.node);
                 }
+                "enum.name" => {
+                    entity_name = text;
+                    entity_type = "enum";
+                }
+                "enum.body" => {
+                    content = text;
+                    target_node = Some(capture.node);
+                }
                 _ => {}
             }
+        }
+
+        if entity_name.is_empty() {
+            continue;
         }
 
         // Agar yeh node ek function hai, toh iske andar ki dependencies (Function calls) nikalte hain

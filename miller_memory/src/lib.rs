@@ -30,7 +30,7 @@ impl MillerMemory {
     }
 
     /// 🛠️ 1. Create Collection: Qdrant ke andar Miller ke liye memory space banana
-    pub async fn init_collection(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn init_collection(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("{}/collections/{}", QDRANT_URL, COLLECTION_NAME);
         
         // Check if collection already exists to avoid overwriting
@@ -69,7 +69,7 @@ impl MillerMemory {
         id: u64,
         vector: Vec<f64>,
         payload: MemoryPayload,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("{}/collections/{}/points", QDRANT_URL, COLLECTION_NAME);
         
         let point_data = json!({
@@ -99,7 +99,7 @@ impl MillerMemory {
         &self,
         query_vector: Vec<f64>,
         limit: usize,
-    ) -> Result<Vec<MemoryPayload>, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<MemoryPayload>, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("{}/collections/{}/points/search", QDRANT_URL, COLLECTION_NAME);
         
         let search_payload = json!({
