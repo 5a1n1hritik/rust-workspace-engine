@@ -3,6 +3,8 @@ use reqwest::Client;
 use serde_json::json;
 use crate::config::{EMBED_URL, EMBED_MODEL, OLLAMA_URL, MODEL_NAME};
 
+use miller_parser::{log_event, LogLevel};
+
 // Inter-module Ollama Vector Embedding Core
 pub async fn get_ollama_embedding(
     client: &Client,
@@ -26,14 +28,14 @@ pub async fn get_ollama_embedding(
     let json_val: serde_json::Value = response.json().await?;
 
     if let Some(err) = json_val.get("error") {
-        eprintln!("[Ollama Debug] Ollama returned error: {:?}", err);
+        log_event(LogLevel::Error, "ollama", &format!("Ollama returned embedding error: {:?}", err));
     }
 
     if let Some(embedding_array) = json_val["embedding"].as_array() {
         let vector: Vec<f64> = embedding_array.iter().map(|v| v.as_f64().unwrap_or(0.0)).collect();
         Ok(vector)
     } else {
-        eprintln!("[Ollama Debug] Unexpected JSON format: {:?}", json_val);
+        log_event(LogLevel::Warn, "ollama", &format!("Unexpected JSON format from embedding API: {:?}", json_val));
         Err("Failed to extract valid embedding vectors from Ollama".into())
     }
 }
@@ -62,7 +64,7 @@ pub async fn generate_with_retry(
                     }
                 }
             }
-            Err(e) => println!("[Client Retry {}] Connection glitch: {}", attempt, e),
+            Err(e) => log_event(LogLevel::Warn, "network", &format!("[Client Retry {}] Connection glitch: {}", attempt, e)),
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }

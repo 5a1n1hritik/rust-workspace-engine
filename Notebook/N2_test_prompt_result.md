@@ -141,3 +141,53 @@ fn main() {
 ```
 ---
 
+# Test 3
+```text
+❯ cargo run -- /home/hritik/Documents/workspace-p/miller_workspace
+   Compiling miller_parser v0.1.0 (/home/hritik/Documents/workspace-p/miller_workspace/miller_parser)
+   Compiling miller_memory v0.1.0 (/home/hritik/Documents/workspace-p/miller_workspace/miller_memory)
+   Compiling miller_core v0.1.0 (/home/hritik/Documents/workspace-p/miller_workspace/miller_core)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.34s
+     Running `/home/hritik/Documents/workspace-p/miller_workspace/target/debug/miller_core /home/hritik/Documents/workspace-p/miller_workspace`
+[13:17:37] [INFO] [MEMORY] Collection 'miller_codebase' already active.
+[13:17:37] [INFO] [SYSTEM] === MILLER: Local Autonomous Coding Framework ===
+[13:17:37] [INFO] [SYSTEM] External project path loaded: "/home/hritik/Documents/workspace-p/miller_workspace"
+
+Miller ko task batao:
+> [13:17:37] [INFO] [BACKGROUND] Silent monitoring loop active: "/home/hritik/Documents/workspace-p/miller_workspace"
+[13:17:37] [INFO] [BACKGROUND] Incremental background indexing scaning...
+[13:17:37] [INFO] [PARSER] New file or change detected. Extracting code: "/home/hritik/Documents/workspace-p/miller_workspace/miller_parser/src/lib.rs"
+[13:17:37] [INFO] [PARSER] New file or change detected. Extracting code: "/home/hritik/Documents/workspace-p/miller_workspace/miller_parser/src/ast_graph.rs"
+[13:17:37] [INFO] [PARSER] New file or change detected. Extracting code: "/home/hritik/Documents/workspace-p/miller_workspace/miller_parser/src/scanner.rs"
+[13:17:37] [INFO] [PARSER] New file or change detected. Extracting code: "/home/hritik/Documents/workspace-p/miller_workspace/miller_memory/src/lib.rs"
+[13:17:37] [INFO] [PARSER] New file or change detected. Extracting code: "/home/hritik/Documents/workspace-p/miller_workspace/miller_core/src/main.rs"
+[13:17:37] [INFO] [PARSER] New file or change detected. Extracting code: "/home/hritik/Documents/workspace-p/miller_workspace/miller_core/src/security.rs"
+[13:17:37] [INFO] [PARSER] New file or change detected. Extracting code: "/home/hritik/Documents/workspace-p/miller_workspace/miller_core/src/config.rs"
+[13:17:37] [INFO] [PARSER] New file or change detected. Extracting code: "/home/hritik/Documents/workspace-p/miller_workspace/miller_core/src/compiler.rs"
+[13:17:37] [INFO] [PARSER] New file or change detected. Extracting code: "/home/hritik/Documents/workspace-p/miller_workspace/miller_core/src/orchestrator.rs"
+[13:17:37] [INFO] [PARSER] New file or change detected. Extracting code: "/home/hritik/Documents/workspace-p/miller_workspace/miller_core/src/network.rs"
+[13:17:37] [INFO] [PARSER] New file or change detected. Extracting code: "/home/hritik/Documents/workspace-p/miller_workspace/miller_core/src/logger.rs"
+[13:17:37] [INFO] [PARSER] Scan Done. Total Checked: 11 | Skipped (Unchanged): 0 | Extracted New Items: 35
+[13:17:37] [INFO] [BACKGROUND] Syncing 35 modified items into local Qdrant...
+[13:17:39] [INFO] [BACKGROUND] Vector embedding database sync cycle completed!
+
+
+```
+
+# Test 4
+```text
+❯ cargo run -- /home/hritik/Documents/workspace-p/wildlife-data-collector
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running `/home/hritik/Documents/workspace-p/miller_workspace/target/debug/miller_core /home/hritik/Documents/workspace-p/wildlife-data-collector`
+[13:18:34] [INFO] [MEMORY] Collection 'miller_codebase' already active.
+[13:18:34] [INFO] [SYSTEM] === MILLER: Local Autonomous Coding Framework ===
+[13:18:34] [INFO] [SYSTEM] External project path loaded: "/home/hritik/Documents/workspace-p/wildlife-data-collector"
+
+Miller ko task batao:
+> [13:18:34] [INFO] [BACKGROUND] Silent monitoring loop active: "/home/hritik/Documents/workspace-p/wildlife-data-collector"
+[13:18:34] [INFO] [BACKGROUND] Incremental background indexing scaning...
+[13:18:34] [INFO] [PARSER] Scan Done. Total Checked: 0 | Skipped (Unchanged): 0 | Extracted New Items: 0
+[13:18:34] [INFO] [BACKGROUND] Cache clean. Workspace state sync complete.
+
+```
+

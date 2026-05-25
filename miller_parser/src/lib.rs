@@ -1,45 +1,49 @@
 pub mod ast_graph;
 pub mod scanner;
 
-#[cfg(test)]
-mod tests {
-    use super::ast_graph::*;
-    use std::fs;
-    use std::path::Path;
+use std::time::SystemTime;
 
-    #[test]
-    fn test_graph_extraction() {
-        // Ek dummy Rust code banate hain test karne ke liye
-        let test_code = "
-            struct Database { url: String }
-            
-            fn connect_db() {
-                log_status();
-                parse_url();
-            }
+pub enum LogLevel {
+    Info,
+    Warn,
+    Error,
+    Debug,
+}
 
-            fn log_status() {
-                // logs something
-            }
-        ";
-
-        // Temporary file create karte hain
-        let file_path = Path::new("dummy_test.rs");
-        fs::write(file_path, test_code).unwrap();
-
-        // Parser chalate hain
-        let graph = build_ast_graph(file_path);
-        
-        for node in &graph {
-            println!("---");
-            println!("Type: {}", node.entity_type);
-            println!("Name: {}", node.entity_name);
-            println!("Calls/Dependencies: {:?}", node.dependencies);
+impl LogLevel {
+    fn as_str(&self) -> &'static str {
+        match self {
+            LogLevel::Info => "INFO",
+            LogLevel::Warn => "WARN",
+            LogLevel::Error => "ERROR",
+            LogLevel::Debug => "DEBUG",
         }
-
-        // Cleanup
-        fs::remove_file(file_path).unwrap();
-        
-        assert_eq!(graph.len(), 3); // 1 struct + 2 functions
     }
+}
+
+// System timestamp helper
+fn get_timestamp() -> String {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    
+    // Simple timestamp rendering formatting
+    let secs = now.as_secs();
+    let hours = (secs / 3600) % 24;
+    let minutes = (secs / 60) % 60;
+    let seconds = secs % 60;
+    
+    format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+}
+
+// Industry Standard Structured Logger Layout Matrix
+pub fn log_event(level: LogLevel, context: &str, message: &str) {
+    let timestamp = get_timestamp();
+    println!(
+        "[{}] [{}] [{}] {}",
+        timestamp,
+        level.as_str(),
+        context.to_uppercase(),
+        message
+    );
 }

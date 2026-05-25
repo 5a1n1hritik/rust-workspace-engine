@@ -6,6 +6,7 @@ use sha2::{Sha256, Digest};
 use serde::{Serialize, Deserialize};
 
 use crate::ast_graph::{build_ast_graph, CodeNode}; 
+use crate::{log_event, LogLevel};
 
 const CACHE_FILE_NAME: &str = ".miller_cache.json";
 
@@ -68,7 +69,7 @@ pub fn scan_and_parse_project_incremental(root_path: &Path) -> (Vec<CodeNode>, u
     let mut total_files_checked = 0;
     let mut files_skipped = 0;
 
-    println!("[Miller Parser] Incremental background indexing scanner chalu ho raha hai...");
+    log_event(LogLevel::Info, "background", &format!("Incremental background indexing scaning..."));
 
     let current_cache = load_cache(root_path);
     let mut updated_cache = CodebaseCache::default();
@@ -109,7 +110,7 @@ pub fn scan_and_parse_project_incremental(root_path: &Path) -> (Vec<CodeNode>, u
                     }
 
                     if needs_reindex {
-                        println!("[Miller Parser] Nayi file ya badlao mila. Code extract ho raha hai: {:?}", path);
+                        log_event(LogLevel::Info, "parser", &format!("New file or change detected. Extracting code: {:?}", path));
                         let mut file_nodes = build_ast_graph(path);
                         changed_nodes.append(&mut file_nodes);
                     } else {
@@ -131,9 +132,10 @@ pub fn scan_and_parse_project_incremental(root_path: &Path) -> (Vec<CodeNode>, u
 
     save_cache(root_path, &updated_cache);
 
-    println!(
-        "[Miller Parser] Scan Done. Total Checked: {} | Skipped (Unchanged): {} | Extracted New Items: {}",
-        total_files_checked, files_skipped, changed_nodes.len()
+    log_event(
+        LogLevel::Info, 
+        "parser", 
+        &format!("Scan Done. Total Checked: {} | Skipped (Unchanged): {} | Extracted New Items: {}", total_files_checked, files_skipped, changed_nodes.len())
     );
 
     (changed_nodes, files_skipped)
