@@ -4,8 +4,6 @@ use std::path::Path;
 use std::time::{Instant, Duration};
 use std::thread;
 
-use crate::config::TARGET_FILE;
-
 // Industry standard execution metrics layout
 pub struct SandboxExecutionResult {
     pub stdout: String,
