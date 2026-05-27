@@ -1,4 +1,3 @@
-// miller_core/src/main.rs
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -11,11 +10,11 @@ mod network;
 mod compiler;
 mod orchestrator;
 
-use config::{HTTP_TIMEOUT, HTTP_POOL_IDLE, TARGET_FILE, EXEC_NAME};
+use config::{HTTP_TIMEOUT, HTTP_POOL_IDLE, TARGET_FILE};
 use security::{is_safe, sanitize_code};
 use network::{get_ollama_embedding, generate_with_retry};
-use compiler::{run_compiler_test, run_sandbox_execution, get_clean_compiler_error};
-use orchestrator::{build_repair_prompt, construct_initial_prompt};
+use compiler::{run_hardened_compile, run_hardened_execution, get_clean_compiler_error};
+use orchestrator::{construct_initial_prompt};
 use miller_parser::{log_event, LogLevel};
 
 use miller_parser::scanner::scan_and_parse_project_incremental;
@@ -158,29 +157,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         fs::write(TARGET_FILE, &code_to_write)?;
-        log_event(LogLevel::Info, "filesystem", &format!("Code successfully written to sandbox: '{}'", TARGET_FILE));
+        log_event(LogLevel::Info, "filesystem", &format!("Code successfully written to local cache: '{}'", TARGET_FILE));
 
-        log_event(LogLevel::Info, "compiler", "Running rustc validation...");
-        match run_compiler_test() {
+        log_event(LogLevel::Info, "compiler", "Phase 1: Running containerized hardened compilation validation...");
+
+        match run_hardened_compile() {
             Ok(true) => {
-                log_event(LogLevel::Info, "compiler", "Code compiled successfully! Moving to Execution Sandbox...");
-                match run_sandbox_execution() {
-                    Ok(stdout) => {
-                        println!("\n[Sandbox Execution Pass]\n--- STDOUT ---\n{}\n--------------", stdout);
-                        let _ = fs::remove_file(EXEC_NAME);
-                        log_event(LogLevel::Info, "engine", "Processing Loop Cycle Ended Successfully.");
-                        break;
+                log_event(LogLevel::Info, "compiler", "Compilation successful! Phase 2: Launching isolated ephemeral sandbox...");
+                
+                match run_hardened_execution() {
+                    Ok(result) => {
+                        if result.timed_out {
+                            log_event(LogLevel::Error, "sandbox", &result.stderr);
+                            
+                            current_prompt = orchestrator::build_repair_prompt(original_task, &code_to_write, &result.stderr, "Runtime Timeout Error");
+                        } else if !result.stderr.is_empty() {
+                            // Agar sandbox ke andar binary crash hui ya stderr aaya
+                            println!("\n[Sandbox Runtime Crash]\n--- STDERR ---\n{}\n--------------", result.stderr);
+
+                            current_prompt = orchestrator::build_repair_prompt(original_task, &code_to_write, &result.stderr, "Runtime Crash Error");
+                        } else {
+                            // Perfect execution match pass
+                            println!("\n[Hardened Sandbox Execution Pass]\n--- STDOUT ---\n{}\n--------------", result.stdout);
+
+                            log_event(LogLevel::Info, "engine", "Processing Loop Cycle Ended Safely and Successfully.");
+                            break;
+                        }
                     }
-                    Err(stderr) => {
-                        log_event(LogLevel::Error, "sandbox", "Executable container crash.");
-                        current_prompt = build_repair_prompt(original_task, &code_to_write, &stderr, "Runtime/Execution Error");
+                    Err(sandbox_err) => {
+                        log_event(LogLevel::Error, "sandbox", &format!("Container isolation failure: {}", sandbox_err));
+                        break;
                     }
                 }
             }
             _ => {
+                // Compile fail hua, extract detailed errors via docker
                 let clean_error = get_clean_compiler_error();
-                log_event(LogLevel::Error, "compiler", "Logic failure details captured during compilation.");
-                current_prompt = build_repair_prompt(original_task, &code_to_write, &clean_error, "Compilation Error");
+
+                log_event(LogLevel::Error, "compiler", "Logic failure details captured during isolated compilation phase.");
+
+                current_prompt = orchestrator::build_repair_prompt(original_task, &code_to_write, &clean_error, "Compilation Error");
             }
         }
     }
