@@ -3,7 +3,6 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use reqwest::Client;
 
-// All modules definitions mapped clearly
 mod config;
 mod security;
 mod network;
@@ -13,12 +12,21 @@ mod orchestrator;
 use config::{HTTP_TIMEOUT, HTTP_POOL_IDLE, TARGET_FILE};
 use security::{is_safe, sanitize_code};
 use network::{get_ollama_embedding, generate_with_retry};
-use compiler::{run_hardened_compile, run_hardened_execution, get_clean_compiler_error};
-use orchestrator::{construct_initial_prompt};
-use miller_parser::{log_event, LogLevel};
+use compiler::{
+    run_hardened_compile, run_hardened_execution, extract_clean_error,
+    get_unique_job_dir, Language, RuntimeConfig,
+};
+use orchestrator::construct_initial_prompt;
+// use miller_parser::{log_event, LogLevel};
+use miller_memory::{log_event, LogLevel};
 
 use miller_parser::scanner::scan_and_parse_project_incremental;
 use miller_memory::{MillerMemory, MemoryPayload};
+
+// ── Retrieval Quality Guard ───────────────────────────────────────────────────
+/// Minimum cosine-similarity score for a vector match to be injected into the prompt.
+/// Matches below this threshold are discarded to prevent low-quality context pollution.
+const MIN_RETRIEVAL_SCORE: f32 = 0.35;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -31,29 +39,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     memory_layer.init_collection().await?;
 
     log_event(LogLevel::Info, "system", "=== MILLER: Local Autonomous Coding Framework ===");
-    
-    // Target Path Discovery Setup
+
+    // ── Target path discovery ─────────────────────────────────────────────────
     let args: Vec<String> = std::env::args().collect();
     let mut target_project_path: Option<PathBuf> = None;
-    
+
     if args.len() > 1 {
         let path = PathBuf::from(&args[1]);
         if path.exists() {
             log_event(LogLevel::Info, "system", &format!("External project path loaded: {:?}", path));
             target_project_path = Some(path);
         } else {
-            log_event(LogLevel::Error, "system", &format!("Path exist nahi karta: {:?}", path));
+            log_event(LogLevel::Error, "system", &format!("Path does not exist: {:?}", path));
             return Ok(());
         }
     } else {
-        log_event(LogLevel::Warn, "system", "No external workspace attached. Background scanner is Idle.");
+        log_event(LogLevel::Warn, "system", "No external workspace attached. Background scanner is idle.");
     }
 
-    // Background Thread
+    // ── Background indexing thread ────────────────────────────────────────────
     if let Some(bg_path) = target_project_path {
         let bg_client = client.clone();
         tokio::task::spawn(async move {
-            log_event(LogLevel::Info, "background", &format!("Silent monitoring loop active: {:?}", bg_path));
+            log_event(
+                LogLevel::Info, "background",
+                &format!("Silent monitoring loop active: {:?}", bg_path),
+            );
 
             let scan_result = tokio::task::spawn_blocking(move || {
                 scan_and_parse_project_incremental(&bg_path)
@@ -67,37 +78,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     return;
                 }
             };
-            
-            if skipped_count > 0 { 
-                log_event(LogLevel::Info, "background", &format!("Fast skip operational: {} files unchanged.", skipped_count));
+
+            if skipped_count > 0 {
+                log_event(
+                    LogLevel::Info, "background",
+                    &format!("Fast skip operational: {} files unchanged.", skipped_count),
+                );
             }
 
-            if changed_nodes.is_empty() { 
-                log_event(LogLevel::Info, "background", "Cache clean. Workspace state sync complete."); 
-                return; 
+            if changed_nodes.is_empty() {
+                log_event(LogLevel::Info, "background", "Cache clean. Workspace state sync complete.");
+                return;
             }
 
-            log_event(LogLevel::Info, "background", &format!("Syncing {} modified items into local Qdrant...", changed_nodes.len()));
+            log_event(
+                LogLevel::Info, "background",
+                &format!("Syncing {} modified items into local Qdrant...", changed_nodes.len()),
+            );
 
             let bg_memory = MillerMemory::new();
-            let mut pseudo_id = std::time::SystemTime::now().duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap().as_secs();
+            let mut pseudo_id = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
 
             for (idx, chunk) in changed_nodes.iter().enumerate() {
                 if let Ok(vector) = get_ollama_embedding(&bg_client, &chunk.source_code).await {
                     let payload = MemoryPayload {
-                        file_path: chunk.file_path.clone(),
+                        file_path:   chunk.file_path.clone(),
                         entity_name: chunk.entity_name.clone(),
                         entity_type: chunk.entity_type.clone(),
-                        content: chunk.source_code.clone(),
+                        content:     chunk.source_code.clone(),
                     };
-                    if let Ok(_) = bg_memory.upsert_code_chunk(pseudo_id, vector, payload).await { pseudo_id += 1; }
+                    if bg_memory.upsert_code_chunk(pseudo_id, vector, payload).await.is_ok() {
+                        pseudo_id += 1;
+                    }
                 }
-                if (idx + 1) % 30 == 0 { tokio::time::sleep(std::time::Duration::from_millis(400)).await; }
+                if (idx + 1) % 30 == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                }
             }
-            log_event(LogLevel::Info, "background", "Vector embedding database sync cycle completed!");
+            log_event(LogLevel::Info, "background", "Vector embedding database sync cycle completed.");
         });
     }
-    
+
+    // ── Task intake ───────────────────────────────────────────────────────────
     print!("\nMiller ko task batao:\n> ");
     io::stdout().flush()?;
 
@@ -105,101 +130,421 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     io::stdin().read_line(&mut original_task)?;
     let original_task = original_task.trim();
 
+    // ── Semantic retrieval with quality guard ─────────────────────────────────
     log_event(LogLevel::Info, "retrieval", "Searching past code patterns from local Qdrant DB...");
     let mut context_code_str = String::new();
-    
+
     if let Ok(query_vector) = get_ollama_embedding(&client, original_task).await {
         if let Ok(matched_chunks) = memory_layer.search_similar_code(query_vector, 2).await {
-            if !matched_chunks.is_empty() {
+            // ── Quality Guard: discard matches below the similarity threshold ──
+            let qualified: Vec<_> = matched_chunks
+                .into_iter()
+                .filter(|chunk| chunk.score >= MIN_RETRIEVAL_SCORE)
+                .collect();
 
-                log_event(LogLevel::Info, "retrieval", "Valid structural matches found. Injecting blocks into prompt context...");
+            if qualified.is_empty() {
+                log_event(
+                    LogLevel::Info, "retrieval",
+                    "No matches above similarity threshold. Proceeding without retrieved context.",
+                );
+            } else {
+                log_event(
+                    LogLevel::Info, "retrieval",
+                    &format!(
+                        "{} qualified match(es) found (score >= {:.2}). Injecting into prompt context.",
+                        qualified.len(),
+                        MIN_RETRIEVAL_SCORE
+                    ),
+                );
 
                 context_code_str.push_str("\n--- RELEVANT EXISTING CONTEXT CODE ---\n");
-
-                for chunk in matched_chunks {
-                    if chunk.file_path.contains("miller_core") || chunk.file_path.contains("miller_parser") { continue; }
-
-                    context_code_str.push_str(&format!("// From File: {}\n// Entity: {}\n{}\n\n", chunk.file_path, chunk.entity_name, chunk.content));
+                for chunk in &qualified {
+                    // Skip internal miller framework files to prevent self-referential noise.
+                    if chunk.payload.file_path.contains("miller_core")
+                        || chunk.payload.file_path.contains("miller_parser")
+                    {
+                        continue;
+                    }
+                    context_code_str.push_str(&format!(
+                        "// From File: {}\n// Entity: {}\n{}\n\n",
+                        chunk.payload.file_path, 
+                        chunk.payload.entity_name, 
+                        chunk.payload.content
+                    ));
                 }
                 context_code_str.push_str("---------------------------------------\n");
             }
         }
     }
-    
-    let mut current_prompt = construct_initial_prompt(&context_code_str, original_task);
+
+    // ── Language selection (Rust default; extend here for multi-language) ─────
+    let active_language = Language::Rust;
+    let runtime_config  = RuntimeConfig::for_language(&active_language);
+
+    let mut current_prompt = construct_initial_prompt(&context_code_str, original_task, &active_language);
     let mut attempts = 0;
     const MAX_ATTEMPTS: usize = 5;
 
+    // ── Agent repair loop ─────────────────────────────────────────────────────
     while attempts < MAX_ATTEMPTS {
         attempts += 1;
-        log_event(LogLevel::Info, "engine", &format!("Generating code (Attempt {}/{})...", attempts, MAX_ATTEMPTS));
-        
+        log_event(
+            LogLevel::Info, "engine",
+            &format!("Generating code (Attempt {}/{})...", attempts, MAX_ATTEMPTS),
+        );
+
         let ai_response = match generate_with_retry(&client, &current_prompt).await {
             Ok(text) => text,
-            Err(e) => { 
-                log_event(LogLevel::Error, "network", &format!("Ollama call permanently failed: {}", e)); 
-                break; 
+            Err(e) => {
+                log_event(LogLevel::Error, "network", &format!("Ollama call permanently failed: {}", e));
+                break;
             }
         };
 
         let code_to_write = match sanitize_code(&ai_response) {
             Some(code) => code,
             None => {
-                log_event(LogLevel::Warn, "sanitizer", "Code standard structure block not captured. Re-prompting...");
-                current_prompt = format!("Your previous response did not contain standard markdown code fences. Please regenerate and wrap properly.\nTask: {}", original_task);
+                log_event(
+                    LogLevel::Warn, "sanitizer",
+                    "Code block not captured in response. Re-prompting...",
+                );
+                current_prompt = format!(
+                    "Your previous response did not contain standard markdown code fences. \
+                     Please regenerate and wrap the code properly.\nTask: {}",
+                    original_task
+                );
                 continue;
             }
         };
 
         if !is_safe(&code_to_write) {
-            log_event(LogLevel::Error, "security", "Dangerous instruction sequence intercepted! Task terminated.");
+            log_event(LogLevel::Error, "security", "Dangerous instruction sequence intercepted. Task terminated.");
             break;
         }
 
         fs::write(TARGET_FILE, &code_to_write)?;
-        log_event(LogLevel::Info, "filesystem", &format!("Code successfully written to local cache: '{}'", TARGET_FILE));
+        log_event(
+            LogLevel::Info, "filesystem",
+            &format!("Code written to host cache: '{}'", TARGET_FILE),
+        );
 
-        log_event(LogLevel::Info, "compiler", "Phase 1: Running containerized hardened compilation validation...");
+        let active_job_dir = get_unique_job_dir();
+        log_event(
+            LogLevel::Info, "compiler",
+            &format!("Phase 1: Compiling inside isolated boundary: {}", active_job_dir),
+        );
 
-        match run_hardened_compile() {
-            Ok(true) => {
-                log_event(LogLevel::Info, "compiler", "Compilation successful! Phase 2: Launching isolated ephemeral sandbox...");
-                
-                match run_hardened_execution() {
+        match run_hardened_compile(&active_job_dir, &runtime_config, TARGET_FILE) {
+            Ok((true, _)) => {
+                log_event(LogLevel::Info, "compiler", "Compilation successful. Phase 2: Launching sandbox...");
+
+                match run_hardened_execution(&active_job_dir, &runtime_config) {
                     Ok(result) => {
+                        // Emit structured telemetry regardless of outcome.
+                        log_event(
+                            LogLevel::Info, "telemetry",
+                            &format!(
+                                "duration={}ms stdout_bytes={} stderr_bytes={} exit_code={:?}",
+                                result.metrics.execution_duration_ms,
+                                result.metrics.stdout_size,
+                                result.metrics.stderr_size,
+                                result.metrics.exit_code,
+                            ),
+                        );
+
                         if result.timed_out {
                             log_event(LogLevel::Error, "sandbox", &result.stderr);
-                            
-                            current_prompt = orchestrator::build_repair_prompt(original_task, &code_to_write, &result.stderr, "Runtime Timeout Error");
+                            current_prompt = orchestrator::build_repair_prompt(
+                                original_task, &code_to_write, &result.stderr, "Runtime Timeout Error",
+                            );
+                        } else if result.limit_exceeded {
+                            log_event(LogLevel::Error, "security", &result.stderr);
+                            current_prompt = orchestrator::build_repair_prompt(
+                                original_task, &code_to_write, &result.stderr,
+                                "Host Pipe Bomb Exploitation Intercept",
+                            );
                         } else if !result.stderr.is_empty() {
-                            // Agar sandbox ke andar binary crash hui ya stderr aaya
-                            println!("\n[Sandbox Runtime Crash]\n--- STDERR ---\n{}\n--------------", result.stderr);
-
-                            current_prompt = orchestrator::build_repair_prompt(original_task, &code_to_write, &result.stderr, "Runtime Crash Error");
+                            log_event(
+                                LogLevel::Error, "sandbox",
+                                &format!("[Runtime Crash]\n{}", result.stderr),
+                            );
+                            current_prompt = orchestrator::build_repair_prompt(
+                                original_task, &code_to_write, &result.stderr, "Runtime Crash Error",
+                            );
                         } else {
-                            // Perfect execution match pass
-                            println!("\n[Hardened Sandbox Execution Pass]\n--- STDOUT ---\n{}\n--------------", result.stdout);
-
-                            log_event(LogLevel::Info, "engine", "Processing Loop Cycle Ended Safely and Successfully.");
+                            log_event(
+                                LogLevel::Info, "engine",
+                                &format!("[Sandbox Execution Pass]\n{}", result.stdout),
+                            );
+                            log_event(LogLevel::Info, "engine", "Processing loop ended successfully.");
                             break;
                         }
                     }
                     Err(sandbox_err) => {
-                        log_event(LogLevel::Error, "sandbox", &format!("Container isolation failure: {}", sandbox_err));
+                        log_event(
+                            LogLevel::Error, "sandbox",
+                            &format!("Container isolation failure: {}", sandbox_err),
+                        );
                         break;
                     }
                 }
             }
-            _ => {
-                // Compile fail hua, extract detailed errors via docker
-                let clean_error = get_clean_compiler_error();
-
-                log_event(LogLevel::Error, "compiler", "Logic failure details captured during isolated compilation phase.");
-
-                current_prompt = orchestrator::build_repair_prompt(original_task, &code_to_write, &clean_error, "Compilation Error");
+            Ok((false, compile_stderr)) => {
+                let clean_error = extract_clean_error(&compile_stderr);
+                log_event(LogLevel::Error, "compiler", "Compilation failed. Error details captured.");
+                current_prompt = orchestrator::build_repair_prompt(
+                    original_task, &code_to_write, &clean_error, "Compilation Error",
+                );
+            }
+            Err(e) => {
+                log_event(
+                    LogLevel::Error, "compiler",
+                    &format!("Critical compile engine failure: {}", e),
+                );
+                break;
             }
         }
     }
+
     Ok(())
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// use std::fs;
+// use std::io::{self, Write};
+// use std::path::PathBuf;
+// use reqwest::Client;
+
+// // All modules definitions mapped clearly
+// mod config;
+// mod security;
+// mod network;
+// mod compiler;
+// mod orchestrator;
+
+// use config::{HTTP_TIMEOUT, HTTP_POOL_IDLE, TARGET_FILE};
+// use security::{is_safe, sanitize_code};
+// use network::{get_ollama_embedding, generate_with_retry};
+// use compiler::{run_hardened_compile, run_hardened_execution, extract_clean_error, get_unique_job_dir};
+// use orchestrator::{construct_initial_prompt};
+// use miller_parser::{log_event, LogLevel};
+
+// use miller_parser::scanner::scan_and_parse_project_incremental;
+// use miller_memory::{MillerMemory, MemoryPayload};
+
+// #[tokio::main]
+// async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+//     let client = Client::builder()
+//         .timeout(HTTP_TIMEOUT)
+//         .pool_idle_timeout(HTTP_POOL_IDLE)
+//         .build()?;
+
+//     let memory_layer = MillerMemory::new();
+//     memory_layer.init_collection().await?;
+
+//     log_event(LogLevel::Info, "system", "=== MILLER: Local Autonomous Coding Framework ===");
+    
+//     // Target Path Discovery Setup
+//     let args: Vec<String> = std::env::args().collect();
+//     let mut target_project_path: Option<PathBuf> = None;
+    
+//     if args.len() > 1 {
+//         let path = PathBuf::from(&args[1]);
+//         if path.exists() {
+//             log_event(LogLevel::Info, "system", &format!("External project path loaded: {:?}", path));
+//             target_project_path = Some(path);
+//         } else {
+//             log_event(LogLevel::Error, "system", &format!("Path exist nahi karta: {:?}", path));
+//             return Ok(());
+//         }
+//     } else {
+//         log_event(LogLevel::Warn, "system", "No external workspace attached. Background scanner is Idle.");
+//     }
+
+//     // Background Thread
+//     if let Some(bg_path) = target_project_path {
+//         let bg_client = client.clone();
+//         tokio::task::spawn(async move {
+//             log_event(LogLevel::Info, "background", &format!("Silent monitoring loop active: {:?}", bg_path));
+
+//             let scan_result = tokio::task::spawn_blocking(move || {
+//                 scan_and_parse_project_incremental(&bg_path)
+//             })
+//             .await;
+
+//             let (changed_nodes, skipped_count) = match scan_result {
+//                 Ok(result) => result,
+//                 Err(e) => {
+//                     log_event(LogLevel::Error, "background", &format!("Scanner thread crashed: {}", e));
+//                     return;
+//                 }
+//             };
+            
+//             if skipped_count > 0 { 
+//                 log_event(LogLevel::Info, "background", &format!("Fast skip operational: {} files unchanged.", skipped_count));
+//             }
+
+//             if changed_nodes.is_empty() { 
+//                 log_event(LogLevel::Info, "background", "Cache clean. Workspace state sync complete."); 
+//                 return; 
+//             }
+
+//             log_event(LogLevel::Info, "background", &format!("Syncing {} modified items into local Qdrant...", changed_nodes.len()));
+
+//             let bg_memory = MillerMemory::new();
+//             let mut pseudo_id = std::time::SystemTime::now().duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap().as_secs();
+
+//             for (idx, chunk) in changed_nodes.iter().enumerate() {
+//                 if let Ok(vector) = get_ollama_embedding(&bg_client, &chunk.source_code).await {
+//                     let payload = MemoryPayload {
+//                         file_path: chunk.file_path.clone(),
+//                         entity_name: chunk.entity_name.clone(),
+//                         entity_type: chunk.entity_type.clone(),
+//                         content: chunk.source_code.clone(),
+//                     };
+//                     if let Ok(_) = bg_memory.upsert_code_chunk(pseudo_id, vector, payload).await { pseudo_id += 1; }
+//                 }
+//                 if (idx + 1) % 30 == 0 { tokio::time::sleep(std::time::Duration::from_millis(400)).await; }
+//             }
+//             log_event(LogLevel::Info, "background", "Vector embedding database sync cycle completed!");
+//         });
+//     }
+    
+//     print!("\nMiller ko task batao:\n> ");
+//     io::stdout().flush()?;
+
+//     let mut original_task = String::new();
+//     io::stdin().read_line(&mut original_task)?;
+//     let original_task = original_task.trim();
+
+//     log_event(LogLevel::Info, "retrieval", "Searching past code patterns from local Qdrant DB...");
+//     let mut context_code_str = String::new();
+    
+//     if let Ok(query_vector) = get_ollama_embedding(&client, original_task).await {
+//         if let Ok(matched_chunks) = memory_layer.search_similar_code(query_vector, 2).await {
+//             if !matched_chunks.is_empty() {
+
+//                 log_event(LogLevel::Info, "retrieval", "Valid structural matches found. Injecting blocks into prompt context...");
+
+//                 context_code_str.push_str("\n--- RELEVANT EXISTING CONTEXT CODE ---\n");
+
+//                 for chunk in matched_chunks {
+//                     if chunk.file_path.contains("miller_core") || chunk.file_path.contains("miller_parser") { continue; }
+
+//                     context_code_str.push_str(&format!("// From File: {}\n// Entity: {}\n{}\n\n", chunk.file_path, chunk.entity_name, chunk.content));
+//                 }
+//                 context_code_str.push_str("---------------------------------------\n");
+//             }
+//         }
+//     }
+    
+//     let mut current_prompt = construct_initial_prompt(&context_code_str, original_task);
+//     let mut attempts = 0;
+//     const MAX_ATTEMPTS: usize = 5;
+
+//     while attempts < MAX_ATTEMPTS {
+//         attempts += 1;
+//         log_event(LogLevel::Info, "engine", &format!("Generating code (Attempt {}/{})...", attempts, MAX_ATTEMPTS));
+        
+//         let ai_response = match generate_with_retry(&client, &current_prompt).await {
+//             Ok(text) => text,
+//             Err(e) => { 
+//                 log_event(LogLevel::Error, "network", &format!("Ollama call permanently failed: {}", e)); 
+//                 break; 
+//             }
+//         };
+
+//         let code_to_write = match sanitize_code(&ai_response) {
+//             Some(code) => code,
+//             None => {
+//                 log_event(LogLevel::Warn, "sanitizer", "Code standard structure block not captured. Re-prompting...");
+//                 current_prompt = format!("Your previous response did not contain standard markdown code fences. Please regenerate and wrap properly.\nTask: {}", original_task);
+//                 continue;
+//             }
+//         };
+
+//         if !is_safe(&code_to_write) {
+//             log_event(LogLevel::Error, "security", "Dangerous instruction sequence intercepted! Task terminated.");
+//             break;
+//         }
+
+//         fs::write(TARGET_FILE, &code_to_write)?;
+//         log_event(LogLevel::Info, "filesystem", &format!("Code successfully written to local cache: '{}'", TARGET_FILE));
+
+//         // FIX: Explicit random non-deterministic dynamic unique job context alignment 
+//         let active_job_dir = get_unique_job_dir();
+//         log_event(LogLevel::Info, "compiler", &format!("Phase 1: Compiling code inside temporary isolated boundary: {}", active_job_dir));
+
+//         match run_hardened_compile(&active_job_dir) {
+//             Ok((true, _)) => {
+//                 log_event(LogLevel::Info, "compiler", "Compilation successful! Phase 2: Launching isolated ephemeral sandbox...");
+                
+//                 match run_hardened_execution(&active_job_dir) {
+//                     Ok(result) => {
+//                         if result.timed_out {
+//                             log_event(LogLevel::Error, "sandbox", &result.stderr);
+//                             current_prompt = orchestrator::build_repair_prompt(original_task, &code_to_write, &result.stderr, "Runtime Timeout Error");
+//                         } else if result.limit_exceeded {
+//                             log_event(LogLevel::Error, "security", &result.stderr);
+//                             current_prompt = orchestrator::build_repair_prompt(original_task, &code_to_write, &result.stderr, "Host Pipe Bomb Exploitation Intercept");
+//                         } else if !result.stderr.is_empty() {
+//                             println!("\n[Sandbox Runtime Crash]\n--- STDERR ---\n{}\n--------------", result.stderr);
+//                             current_prompt = orchestrator::build_repair_prompt(original_task, &code_to_write, &result.stderr, "Runtime Crash Error");
+//                         } else {
+//                             println!("\n[Hardened Sandbox Execution Pass]\n--- STDOUT ---\n{}\n--------------", result.stdout);
+//                             log_event(LogLevel::Info, "engine", "Processing Loop Cycle Ended Safely and Successfully.");
+//                             break;
+//                         }
+//                     }
+//                     Err(sandbox_err) => {
+//                         log_event(LogLevel::Error, "sandbox", &format!("Container isolation failure: {}", sandbox_err));
+//                         break;
+//                     }
+//                 }
+//             }
+//             Ok((false, compile_stderr)) => {
+//                 let clean_error = extract_clean_error(&compile_stderr);
+//                 log_event(LogLevel::Error, "compiler", "Logic failure details captured during isolated compilation phase.");
+//                 current_prompt = orchestrator::build_repair_prompt(original_task, &code_to_write, &clean_error, "Compilation Error");
+//             }
+//             Err(e) => {
+//                 log_event(LogLevel::Error, "compiler", &format!("Critical compile engine failure: {}", e));
+//                 break;
+//             }
+//         }
+//     }
+//     Ok(())
+// }
 
