@@ -8,6 +8,7 @@ mod security;
 mod network;
 mod compiler;
 mod orchestrator;
+mod session;
 
 use config::{HTTP_TIMEOUT, HTTP_POOL_IDLE, TARGET_FILE};
 use security::{is_safe, sanitize_code};
@@ -19,6 +20,7 @@ use compiler::{
 use orchestrator::construct_initial_prompt;
 // use miller_parser::{log_event, LogLevel};
 use miller_memory::{log_event, LogLevel};
+use session::{AgentState, SessionState, save_session, load_last_session, clear_session}; 
 
 use miller_parser::scanner::scan_and_parse_project_incremental;
 use miller_memory::{MillerMemory, MemoryPayload};
@@ -122,84 +124,145 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         });
     }
 
-    // ── Task intake ───────────────────────────────────────────────────────────
-    print!("\nMiller ko task batao:\n> ");
-    io::stdout().flush()?;
-
+    // ── CRASH RECOVERY INTERCEPTOR LAYER ──────────────────────────────────
     let mut original_task = String::new();
-    io::stdin().read_line(&mut original_task)?;
-    let original_task = original_task.trim();
+    let mut current_prompt = String::new();
+    let mut attempts = 0;
+    let mut resumed_session = false;
 
-    // ── Semantic retrieval with quality guard ─────────────────────────────────
-    log_event(LogLevel::Info, "retrieval", "Searching past code patterns from local Qdrant DB...");
-    let mut context_code_str = String::new();
+    if let Some(last_session) = load_last_session() {
+        log_event(LogLevel::Warn, "recovery", "Detected a previously interrupted or crashed session checkpoint!");
+        log_event(LogLevel::Info, "recovery", &format!("Interrupted Task: \"{}\"", last_session.task));
+        log_event(LogLevel::Info, "recovery", &format!("Last Known State: {:?}", last_session.current_state));
+        print!("Do you want to resume this session? (y/N): ");
+        io::stdout().flush()?;
 
-    if let Ok(query_vector) = get_ollama_embedding(&client, original_task).await {
-        if let Ok(matched_chunks) = memory_layer.search_similar_code(query_vector, 2).await {
-            // ── Quality Guard: discard matches below the similarity threshold ──
-            let qualified: Vec<_> = matched_chunks
-                .into_iter()
-                .filter(|chunk| chunk.score >= MIN_RETRIEVAL_SCORE)
-                .collect();
+        let mut user_choice = String::new();
+        io::stdin().read_line(&mut user_choice)?;
+        
+        if user_choice.trim().to_lowercase() == "y" {
+            log_event(LogLevel::Info, "recovery", "Re-loading active session metrics state machine...");
+            original_task = last_session.task;
+            attempts = last_session.attempt;
+            resumed_session = true;
 
-            if qualified.is_empty() {
-                log_event(
-                    LogLevel::Info, "retrieval",
-                    "No matches above similarity threshold. Proceeding without retrieved context.",
+            // State recovering checkpoint routing
+            if last_session.current_state == AgentState::Failed && !last_session.last_error.is_empty() {
+                current_prompt = orchestrator::build_repair_prompt(
+                    &original_task, &last_session.generated_code, &last_session.last_error, "Recovered Crash Error"
                 );
             } else {
-                log_event(
-                    LogLevel::Info, "retrieval",
-                    &format!(
-                        "{} qualified match(es) found (score >= {:.2}). Injecting into prompt context.",
-                        qualified.len(),
-                        MIN_RETRIEVAL_SCORE
-                    ),
-                );
+                current_prompt = last_session.generated_code; // Pipeline fallthrough retry
+            }
+        } else {
+            log_event(LogLevel::Info, "recovery", "Discarding stale session tokens.");
+            clear_session();
+        }
+    }
 
-                context_code_str.push_str("\n--- RELEVANT EXISTING CONTEXT CODE ---\n");
-                for chunk in &qualified {
-                    // Skip internal miller framework files to prevent self-referential noise.
-                    if chunk.payload.file_path.contains("miller_core")
-                        || chunk.payload.file_path.contains("miller_parser")
-                    {
-                        continue;
+    let mut context_code_str = String::new();
+    // If not recovering, proceed with a standard interactive prompt intake session
+    if original_task.is_empty() {
+        // ── Task intake ───────────────────────────────────────────────────────────
+        print!("\nMiller ko task batao:\n> ");
+        io::stdout().flush()?;
+
+        // let mut original_task = String::new();
+        io::stdin().read_line(&mut original_task)?;
+        let original_task = original_task.trim();
+
+        // ── Semantic retrieval with quality guard ─────────────────────────────────
+        log_event(LogLevel::Info, "retrieval", "Searching past code patterns from local Qdrant DB...");
+
+        if let Ok(query_vector) = get_ollama_embedding(&client, original_task).await {
+            if let Ok(matched_chunks) = memory_layer.search_similar_code(query_vector, 2).await {
+                // ── Quality Guard: discard matches below the similarity threshold ──
+                let qualified: Vec<_> = matched_chunks
+                    .into_iter()
+                    .filter(|chunk| chunk.score >= MIN_RETRIEVAL_SCORE)
+                    .collect();
+
+                if qualified.is_empty() {
+                    log_event(
+                        LogLevel::Info, "retrieval",
+                        "No matches above similarity threshold. Proceeding without retrieved context.",
+                    );
+                } else {
+                    log_event(
+                        LogLevel::Info, "retrieval",
+                        &format!(
+                            "{} qualified match(es) found (score >= {:.2}). Injecting into prompt context.",
+                            qualified.len(),
+                            MIN_RETRIEVAL_SCORE
+                        ),
+                    );
+
+                    context_code_str.push_str("\n--- RELEVANT EXISTING CONTEXT CODE ---\n");
+                    for chunk in &qualified {
+                        // Skip internal miller framework files to prevent self-referential noise.
+                        if chunk.payload.file_path.contains("miller_core")
+                            || chunk.payload.file_path.contains("miller_parser")
+                        {
+                            continue;
+                        }
+                        context_code_str.push_str(&format!(
+                            "// From File: {}\n// Entity: {}\n{}\n\n",
+                            chunk.payload.file_path, 
+                            chunk.payload.entity_name, 
+                            chunk.payload.content
+                        ));
                     }
-                    context_code_str.push_str(&format!(
-                        "// From File: {}\n// Entity: {}\n{}\n\n",
-                        chunk.payload.file_path, 
-                        chunk.payload.entity_name, 
-                        chunk.payload.content
-                    ));
+                    context_code_str.push_str("---------------------------------------\n");
                 }
-                context_code_str.push_str("---------------------------------------\n");
             }
         }
+
+        let active_language = Language::Rust;
+        current_prompt = construct_initial_prompt(&context_code_str, &original_task, &active_language);
     }
 
     // ── Language selection (Rust default; extend here for multi-language) ─────
     let active_language = Language::Rust;
     let runtime_config  = RuntimeConfig::for_language(&active_language);
 
-    let mut current_prompt = construct_initial_prompt(&context_code_str, original_task, &active_language);
-    let mut attempts = 0;
+    if current_prompt.is_empty() {
+        current_prompt = construct_initial_prompt(&context_code_str, &original_task, &active_language);
+    }
+    
     const MAX_ATTEMPTS: usize = 5;
 
     // ── Agent repair loop ─────────────────────────────────────────────────────
     while attempts < MAX_ATTEMPTS {
-        attempts += 1;
-        log_event(
-            LogLevel::Info, "engine",
-            &format!("Generating code (Attempt {}/{})...", attempts, MAX_ATTEMPTS),
-        );
+        if !resumed_session {
+            attempts += 1;
+        }
+        resumed_session = false; // Reset toggle instantly to allow linear steps next iteration
+
+        log_event(LogLevel::Info, "engine", &format!("Transitioning State: [AgentState::Generating] (Attempt {}/{})...", attempts, MAX_ATTEMPTS));
+
+        let mut active_session = SessionState {
+            task: original_task.clone(),
+            attempt: attempts,
+            current_state: AgentState::Generating,
+            generated_code: current_prompt.clone(),
+            last_error: String::new(),
+        };
+        let _ = save_session(&active_session);
 
         let ai_response = match generate_with_retry(&client, &current_prompt).await {
             Ok(text) => text,
             Err(e) => {
                 log_event(LogLevel::Error, "network", &format!("Ollama call permanently failed: {}", e));
+                active_session.current_state = AgentState::Failed;
+                active_session.last_error = e.to_string();
+                let _ = save_session(&active_session);
                 break;
             }
         };
+
+        log_event(LogLevel::Info, "engine", "Transitioning State: [AgentState::Sanitizing]");
+        active_session.current_state = AgentState::Sanitizing;
+        let _ = save_session(&active_session);
 
         let code_to_write = match sanitize_code(&ai_response) {
             Some(code) => code,
@@ -208,17 +271,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     LogLevel::Warn, "sanitizer",
                     "Code block not captured in response. Re-prompting...",
                 );
-                current_prompt = format!(
-                    "Your previous response did not contain standard markdown code fences. \
-                     Please regenerate and wrap the code properly.\nTask: {}",
-                    original_task
-                );
+                current_prompt = format!("Your previous response did not contain standard markdown code fences. Please regenerate and wrap the code properly.\nTask: {}", original_task);
                 continue;
             }
         };
 
+        log_event(LogLevel::Info, "engine", "Transitioning State: [AgentState::SecurityScanning]");
         if !is_safe(&code_to_write) {
             log_event(LogLevel::Error, "security", "Dangerous instruction sequence intercepted. Task terminated.");
+            active_session.current_state = AgentState::Failed;
+            active_session.last_error = "Security Scan Intercepted Rule Infraction".to_string();
+            let _ = save_session(&active_session);
             break;
         }
 
@@ -229,62 +292,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         );
 
         let active_job_dir = get_unique_job_dir();
-        log_event(
-            LogLevel::Info, "compiler",
-            &format!("Phase 1: Compiling inside isolated boundary: {}", active_job_dir),
-        );
+        log_event(LogLevel::Info, "engine", &format!("Transitioning State: [AgentState::Compiling] inside directory: {}", active_job_dir));
+        active_session.current_state = AgentState::Compiling;
+        active_session.generated_code = code_to_write.clone();
+        let _ = save_session(&active_session);
 
         match run_hardened_compile(&active_job_dir, &runtime_config, TARGET_FILE) {
             Ok((true, _)) => {
-                log_event(LogLevel::Info, "compiler", "Compilation successful. Phase 2: Launching sandbox...");
+                log_event(LogLevel::Info, "engine", "Transitioning State: [AgentState::Executing] inside ephemeral container boundary...");
+                active_session.current_state = AgentState::Executing;
+                let _ = save_session(&active_session);
 
                 match run_hardened_execution(&active_job_dir, &runtime_config) {
                     Ok(result) => {
-                        // Emit structured telemetry regardless of outcome.
-                        log_event(
-                            LogLevel::Info, "telemetry",
-                            &format!(
-                                "duration={}ms stdout_bytes={} stderr_bytes={} exit_code={:?}",
-                                result.metrics.execution_duration_ms,
-                                result.metrics.stdout_size,
-                                result.metrics.stderr_size,
-                                result.metrics.exit_code,
-                            ),
-                        );
+                        log_event(LogLevel::Info, "telemetry", &format!(
+                            "duration={}ms stdout_bytes={} stderr_bytes={} exit_code={:?}",
+                            result.metrics.execution_duration_ms, result.metrics.stdout_size, result.metrics.stderr_size, result.metrics.exit_code,
+                        ));
 
                         if result.timed_out {
                             log_event(LogLevel::Error, "sandbox", &result.stderr);
-                            current_prompt = orchestrator::build_repair_prompt(
-                                original_task, &code_to_write, &result.stderr, "Runtime Timeout Error",
-                            );
+                            active_session.current_state = AgentState::Failed;
+                            active_session.last_error = result.stderr.clone();
+                            let _ = save_session(&active_session);
+
+                            current_prompt = orchestrator::build_repair_prompt(&original_task, &code_to_write, &result.stderr, "Runtime Timeout Error");
                         } else if result.limit_exceeded {
                             log_event(LogLevel::Error, "security", &result.stderr);
-                            current_prompt = orchestrator::build_repair_prompt(
-                                original_task, &code_to_write, &result.stderr,
-                                "Host Pipe Bomb Exploitation Intercept",
-                            );
+                            active_session.current_state = AgentState::Failed;
+                            active_session.last_error = result.stderr.clone();
+                            let _ = save_session(&active_session);
+
+                            current_prompt = orchestrator::build_repair_prompt(&original_task, &code_to_write, &result.stderr, "Host Pipe Bomb Exploitation Intercept");
                         } else if !result.stderr.is_empty() {
-                            log_event(
-                                LogLevel::Error, "sandbox",
-                                &format!("[Runtime Crash]\n{}", result.stderr),
-                            );
-                            current_prompt = orchestrator::build_repair_prompt(
-                                original_task, &code_to_write, &result.stderr, "Runtime Crash Error",
-                            );
+                            log_event(LogLevel::Error, "sandbox", &format!("[Runtime Crash]\n{}", result.stderr));
+                            active_session.current_state = AgentState::Failed;
+                            active_session.last_error = result.stderr.clone();
+                            let _ = save_session(&active_session);
+
+                            current_prompt = orchestrator::build_repair_prompt(&original_task, &code_to_write, &result.stderr, "Runtime Crash Error");
                         } else {
-                            log_event(
-                                LogLevel::Info, "engine",
-                                &format!("[Sandbox Execution Pass]\n{}", result.stdout),
-                            );
-                            log_event(LogLevel::Info, "engine", "Processing loop ended successfully.");
+                            log_event(LogLevel::Info, "engine", &format!("[Sandbox Execution Pass]\n{}", result.stdout));
+                            log_event(LogLevel::Info, "engine", "Transitioning State: [AgentState::Complete]. Processing loop ended successfully.");
+                            clear_session(); // Wipe persistence cache on absolute success state
                             break;
                         }
                     }
                     Err(sandbox_err) => {
-                        log_event(
-                            LogLevel::Error, "sandbox",
-                            &format!("Container isolation failure: {}", sandbox_err),
-                        );
+                        log_event(LogLevel::Error, "sandbox", &format!("Container isolation failure: {}", sandbox_err));
                         break;
                     }
                 }
@@ -292,15 +347,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok((false, compile_stderr)) => {
                 let clean_error = extract_clean_error(&compile_stderr);
                 log_event(LogLevel::Error, "compiler", "Compilation failed. Error details captured.");
-                current_prompt = orchestrator::build_repair_prompt(
-                    original_task, &code_to_write, &clean_error, "Compilation Error",
-                );
+                active_session.current_state = AgentState::Failed;
+                active_session.last_error = clean_error.clone();
+                let _ = save_session(&active_session);
+
+                current_prompt = orchestrator::build_repair_prompt(&original_task, &code_to_write, &clean_error, "Compilation Error");
             }
             Err(e) => {
-                log_event(
-                    LogLevel::Error, "compiler",
-                    &format!("Critical compile engine failure: {}", e),
-                );
+                log_event(LogLevel::Error, "compiler", &format!("Critical compile engine failure: {}", e));
                 break;
             }
         }
