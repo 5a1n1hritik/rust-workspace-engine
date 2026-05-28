@@ -12,6 +12,7 @@ pub fn is_safe(code: &str) -> bool {
 }
 
 // Code content ko markdown fences se nikalne ka logic
+#[allow(dead_code)]
 pub fn sanitize_code(raw: &str) -> Option<String> {
     let re = Regex::new(r"(?s)```rust(.*?)```").ok()?;
     let mut code = if let Some(captures) = re.captures(raw) {

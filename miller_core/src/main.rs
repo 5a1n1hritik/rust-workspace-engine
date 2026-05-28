@@ -11,87 +11,197 @@ mod orchestrator;
 mod session;
 
 use config::{HTTP_TIMEOUT, HTTP_POOL_IDLE, TARGET_FILE};
-use security::{is_safe, sanitize_code};
+use security::is_safe;
 use network::{get_ollama_embedding, generate_with_retry};
 use compiler::{
-    // Scratchpad mode
     run_hardened_compile, run_hardened_execution, get_unique_job_dir,
-    // Workspace mode
-    run_workspace_check, run_workspace_execution,
-    // Shared
+    run_workspace_check_at, run_workspace_execution,
     extract_clean_error, Language, RuntimeConfig,
 };
-use orchestrator::construct_initial_prompt;
+use orchestrator::{construct_initial_prompt, FILE_TAG_OPEN, FILE_TAG_SEP, FILE_TAG_CLOSE};
 use miller_memory::{log_event, LogLevel};
 use session::{AgentState, SessionState, save_session, load_last_session, clear_session};
 
 use miller_parser::scanner::scan_and_parse_project_incremental;
 use miller_memory::{MillerMemory, MemoryPayload};
 
-// ── Retrieval Quality Guard ───────────────────────────────────────────────────
-/// Minimum cosine-similarity score for a vector match to be injected into the
-/// prompt. Matches below this threshold are silently discarded.
+// ── Retrieval quality guard ───────────────────────────────────────────────────
+
 const MIN_RETRIEVAL_SCORE: f32 = 0.35;
 
-// ── File-target extraction ────────────────────────────────────────────────────
-/// Attempt to extract a relative file path hint from the AI's response.
-///
-/// The AI is instructed (via the initial prompt) to annotate its code block with
-/// a comment of the form:
-///
-/// ```
-/// // TARGET_FILE: src/some_module.rs
-/// ```
-///
-/// If found, the path is returned as a relative string so the caller can resolve
-/// it against the workspace root. If absent, `None` is returned and the caller
-/// falls back to the single-file scratchpad.
-fn extract_target_file_hint(ai_response: &str) -> Option<String> {
-    for line in ai_response.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("// TARGET_FILE:") {
-            let path = rest.trim().to_string();
-            if !path.is_empty() {
-                return Some(path);
-            }
-        }
-    }
-    None
+// ═══════════════════════════════════════════════════════════════════════════════
+// MULTI-FILE PARSER ENGINE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A single parsed file block from the LLM response.
+#[derive(Debug, Clone)]
+pub struct ParsedFile {
+    /// Relative path as emitted by the model (already sanitised).
+    pub rel_path: String,
+    /// Raw file contents between the open and close tags.
+    pub contents: String,
 }
 
-/// Write generated code to the correct location.
+/// Parse ALL `<file path="...">...</file>` blocks out of `response`.
 ///
-/// - **Workspace mode**: resolves the AI-provided `target_hint` against
-///   `workspace_root`, creates any missing parent directories, and writes the
-///   file in place. Returns the absolute host path that was written.
-/// - **Scratchpad mode** (no workspace): falls back to writing `TARGET_FILE`.
-///   Returns that path.
-fn write_code_to_target(
-    code: &str,
-    workspace_root: Option<&str>,
-    target_hint: Option<&str>,
-) -> Result<String, std::io::Error> {
-    match (workspace_root, target_hint) {
-        (Some(root), Some(hint)) => {
-            // Sanitise: strip any leading `/` or `./` so the path is always
-            // relative and cannot escape the workspace root.
-            let rel = hint.trim_start_matches('/').trim_start_matches("./");
-            let abs_path = Path::new(root).join(rel);
+/// Uses only `str::find` / slice indexing — no external XML crate.
+///
+/// Edge cases handled:
+/// - Whitespace inside the opening tag attribute.
+/// - Leading/trailing whitespace in path values.
+/// - Nested content that contains the literal string `</file>` in a comment
+///   is NOT supported (the LLM is instructed never to nest tags), but the
+///   parser is greedy-first-match safe for normal code.
+/// - Returns an empty `Vec` if no valid blocks are found.
+pub fn parse_file_blocks(response: &str) -> Vec<ParsedFile> {
+    let mut files  = Vec::new();
+    let mut cursor = 0usize;
 
-            if let Some(parent) = abs_path.parent() {
-                fs::create_dir_all(parent)?;
+    loop {
+        // Locate the next opening tag prefix: `<file path="`
+        let tag_start = match response[cursor..].find(FILE_TAG_OPEN) {
+            Some(offset) => cursor + offset,
+            None         => break,
+        };
+
+        // The path value starts immediately after FILE_TAG_OPEN.
+        let path_value_start = tag_start + FILE_TAG_OPEN.len();
+
+        // The path value ends at the closing `">` separator.
+        let sep_pos = match response[path_value_start..].find(FILE_TAG_SEP) {
+            Some(offset) => path_value_start + offset,
+            None         => {
+                // Malformed opening tag — skip past this match and continue.
+                cursor = tag_start + FILE_TAG_OPEN.len();
+                continue;
             }
+        };
 
-            fs::write(&abs_path, code)?;
-            Ok(abs_path.to_string_lossy().to_string())
+        let raw_path = response[path_value_start..sep_pos].trim();
+
+        // Sanitise: strip leading `/`, `./`, and any `../` sequences so the
+        // resolved path can never escape the workspace/job root.
+        let safe_path = raw_path
+            .trim_start_matches('/')
+            .trim_start_matches("./");
+        // Reject anything that still contains a `..` component after stripping.
+        if safe_path.contains("..") || safe_path.is_empty() {
+            cursor = sep_pos + FILE_TAG_SEP.len();
+            continue;
         }
-        // No hint or no workspace → scratchpad fallback
-        _ => {
-            fs::write(TARGET_FILE, code)?;
-            Ok(TARGET_FILE.to_string())
+
+        // Content starts immediately after `">`.
+        let content_start = sep_pos + FILE_TAG_SEP.len();
+
+        // Content ends at the first `</file>` after content_start.
+        let close_pos = match response[content_start..].find(FILE_TAG_CLOSE) {
+            Some(offset) => content_start + offset,
+            None         => {
+                // No closing tag found — remainder is malformed; stop parsing.
+                break;
+            }
+        };
+
+        let contents = response[content_start..close_pos].to_string();
+        // Trim a single leading newline that the model may insert after `">`
+        // to keep indentation clean.
+        let contents = contents
+            .strip_prefix('\n')
+            .unwrap_or(&contents)
+            .to_string();
+
+        files.push(ParsedFile {
+            rel_path: safe_path.to_string(),
+            contents,
+        });
+
+        // Advance past the closing tag for the next iteration.
+        cursor = close_pos + FILE_TAG_CLOSE.len();
+    }
+
+    files
+}
+
+/// Write all parsed file blocks to disk under `root_dir`.
+///
+/// - Creates missing parent directories automatically.
+/// - Returns a `Vec<String>` of the absolute host paths that were written,
+///   in the same order as `files`.
+/// - Returns an `Err` on the first I/O failure (partial writes are possible;
+///   the caller should treat any error as a reason to re-prompt).
+pub fn write_parsed_files(
+    files: &[ParsedFile],
+    root_dir: &str,
+) -> Result<Vec<String>, std::io::Error> {
+    let mut written = Vec::with_capacity(files.len());
+
+    for pf in files {
+        let abs = Path::new(root_dir).join(&pf.rel_path);
+        if let Some(parent) = abs.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&abs, &pf.contents)?;
+        written.push(abs.to_string_lossy().to_string());
+    }
+
+    Ok(written)
+}
+
+/// Reconstruct a multi-file tagged string from a slice of `ParsedFile`s.
+///
+/// Used to populate `SessionState::generated_code` so that a recovered session
+/// can re-emit the same tagged format into the repair prompt, keeping the
+/// round-trip format consistent.
+pub fn files_to_tagged_repr(files: &[ParsedFile]) -> String {
+    let mut out = String::new();
+    for pf in files {
+        out.push_str(&format!(
+            "{}{}{}\n{}\n{}\n",
+            FILE_TAG_OPEN, pf.rel_path, FILE_TAG_SEP,
+            pf.contents,
+            FILE_TAG_CLOSE,
+        ));
+    }
+    out
+}
+
+/// Run the security scanner across all file contents in a parsed set.
+/// Returns `false` and logs the offending path as soon as a violation is found.
+fn scan_all_files(files: &[ParsedFile]) -> bool {
+    for pf in files {
+        if !is_safe(&pf.contents) {
+            return false;
         }
     }
+    true
 }
+
+/// Detect whether a Cargo.toml is present in the written file list and return
+/// its **container-side** path (`/workspace/Cargo.toml`).
+///
+/// For Rust projects this is always `/workspace/Cargo.toml`; we verify the
+/// model actually emitted it so we can give a clear error if it did not.
+fn find_container_manifest(files: &[ParsedFile], lang: &Language) -> Option<String> {
+    let descriptor = match lang {
+        Language::Rust   => "Cargo.toml",
+        Language::Python => "main.py",
+    };
+    files
+        .iter()
+        .find(|f| {
+            // Accept the manifest at any depth (e.g. "Cargo.toml" or
+            // "my_project/Cargo.toml"), but prefer the shallowest one.
+            Path::new(&f.rel_path)
+                .file_name()
+                .map(|n| n == descriptor)
+                .unwrap_or(false)
+        })
+        .map(|f| format!("/workspace/{}", f.rel_path))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAIN
+// ═══════════════════════════════════════════════════════════════════════════════
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -105,70 +215,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     log_event(LogLevel::Info, "system", "=== MILLER: Local Autonomous Coding Framework ===");
 
-    // ── CLI argument: external workspace path ─────────────────────────────────
+    // ── CLI: external workspace path ──────────────────────────────────────────
     let args: Vec<String> = std::env::args().collect();
     let mut target_project_path: Option<PathBuf> = None;
 
     if args.len() > 1 {
         let path = PathBuf::from(&args[1]);
         if path.exists() {
-            log_event(
-                LogLevel::Info, "system",
-                &format!("External workspace loaded: {:?}", path),
-            );
+            log_event(LogLevel::Info, "system", &format!("External workspace loaded: {:?}", path));
             target_project_path = Some(path);
         } else {
-            log_event(
-                LogLevel::Error, "system",
-                &format!("Workspace path does not exist: {:?}", path),
-            );
+            log_event(LogLevel::Error, "system", &format!("Workspace path does not exist: {:?}", path));
             return Ok(());
         }
     } else {
-        log_event(
-            LogLevel::Warn, "system",
-            "No external workspace attached. Running in scratchpad mode.",
-        );
+        log_event(LogLevel::Warn, "system", "No external workspace attached. Running in scratchpad mode.");
     }
 
-    // Snapshot the workspace root as a plain string for lifetime-free passing.
-    // `None` → scratchpad mode throughout the session.
     let workspace_root: Option<String> = target_project_path
         .as_ref()
         .map(|p| p.to_string_lossy().to_string());
 
     // ── Background indexing thread ────────────────────────────────────────────
     if let Some(ref bg_path) = target_project_path {
-        let bg_path  = bg_path.clone();
+        let bg_path   = bg_path.clone();
         let bg_client = client.clone();
 
         tokio::task::spawn(async move {
-            log_event(
-                LogLevel::Info, "background",
-                &format!("Silent monitoring loop active: {:?}", bg_path),
-            );
+            log_event(LogLevel::Info, "background",
+                &format!("Silent monitoring loop active: {:?}", bg_path));
 
             let scan_result = tokio::task::spawn_blocking(move || {
                 scan_and_parse_project_incremental(&bg_path)
-            })
-            .await;
+            }).await;
 
             let (changed_nodes, skipped_count) = match scan_result {
-                Ok(result) => result,
+                Ok(r)  => r,
                 Err(e) => {
-                    log_event(
-                        LogLevel::Error, "background",
-                        &format!("Scanner thread crashed: {}", e),
-                    );
+                    log_event(LogLevel::Error, "background",
+                        &format!("Scanner thread crashed: {}", e));
                     return;
                 }
             };
 
             if skipped_count > 0 {
-                log_event(
-                    LogLevel::Info, "background",
-                    &format!("Fast skip operational: {} files unchanged.", skipped_count),
-                );
+                log_event(LogLevel::Info, "background",
+                    &format!("Fast skip operational: {} files unchanged.", skipped_count));
             }
 
             if changed_nodes.is_empty() {
@@ -176,10 +268,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 return;
             }
 
-            log_event(
-                LogLevel::Info, "background",
-                &format!("Syncing {} modified items into local Qdrant...", changed_nodes.len()),
-            );
+            log_event(LogLevel::Info, "background",
+                &format!("Syncing {} modified items into local Qdrant...", changed_nodes.len()));
 
             let bg_memory  = MillerMemory::new();
             let mut pseudo_id = std::time::SystemTime::now()
@@ -214,34 +304,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut resumed_session = false;
 
     if let Some(last_session) = load_last_session() {
-        log_event(
-            LogLevel::Warn, "recovery",
-            "Detected a previously interrupted session checkpoint!",
-        );
-        log_event(
-            LogLevel::Info, "recovery",
-            &format!("Interrupted Task: \"{}\"", last_session.task),
-        );
-        log_event(
-            LogLevel::Info, "recovery",
-            &format!("Last Known State: {:?}", last_session.current_state),
-        );
+        log_event(LogLevel::Warn,  "recovery", "Detected a previously interrupted session checkpoint!");
+        log_event(LogLevel::Info,  "recovery", &format!("Interrupted Task: \"{}\"", last_session.task));
+        log_event(LogLevel::Info,  "recovery", &format!("Last Known State: {:?}", last_session.current_state));
 
         print!("Resume this session? (y/N): ");
         io::stdout().flush()?;
-
         let mut choice = String::new();
         io::stdin().read_line(&mut choice)?;
 
         if choice.trim().to_lowercase() == "y" {
             log_event(LogLevel::Info, "recovery", "Re-loading active session state machine...");
-            original_task = last_session.task.clone();
-            attempts      = last_session.attempt;
+            original_task   = last_session.task.clone();
+            attempts        = last_session.attempt;
             resumed_session = true;
 
             if last_session.current_state == AgentState::Failed
                 && !last_session.last_error.is_empty()
             {
+                // `generated_code` stores the tagged file repr from the last
+                // attempt; feed it back into the repair prompt so the model
+                // sees the same format it is expected to produce.
                 current_prompt = orchestrator::build_repair_prompt(
                     &last_session.task,
                     &last_session.generated_code,
@@ -261,28 +344,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut context_code_str = String::new();
 
     if original_task.is_empty() {
-        // Tell the user which mode is active so they can phrase the task correctly.
         match &workspace_root {
-            Some(root) => log_event(
-                LogLevel::Info, "system",
-                &format!(
-                    "Workspace mode active. Target project: {}  \
-                     (Tip: include '// TARGET_FILE: <rel/path>' in your task to map output to a specific file)",
-                    root
-                ),
-            ),
-            None => log_event(
-                LogLevel::Info, "system",
-                "Scratchpad mode active. Generated code will be compiled as a standalone program.",
-            ),
+            Some(root) => log_event(LogLevel::Info, "system",
+                &format!("Workspace mode active — project: {}", root)),
+            None       => log_event(LogLevel::Info, "system",
+                "Scratchpad mode active. Multi-file output will be written to a temporary job directory."),
         }
 
         print!("\nMiller ko task batao:\n> ");
         io::stdout().flush()?;
-
         io::stdin().read_line(&mut original_task)?;
-        let trimmed = original_task.trim().to_string();
-        original_task = trimmed;
+        original_task = original_task.trim().to_string();
 
         // ── Semantic retrieval with quality guard ─────────────────────────
         log_event(LogLevel::Info, "retrieval", "Searching past code patterns from local Qdrant DB...");
@@ -295,18 +367,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     .collect();
 
                 if qualified.is_empty() {
-                    log_event(
-                        LogLevel::Info, "retrieval",
-                        "No matches above similarity threshold. Proceeding without retrieved context.",
-                    );
+                    log_event(LogLevel::Info, "retrieval",
+                        "No matches above similarity threshold. Proceeding without retrieved context.");
                 } else {
-                    log_event(
-                        LogLevel::Info, "retrieval",
-                        &format!(
-                            "{} qualified match(es) (score >= {:.2}). Injecting into prompt context.",
-                            qualified.len(), MIN_RETRIEVAL_SCORE,
-                        ),
-                    );
+                    log_event(LogLevel::Info, "retrieval",
+                        &format!("{} qualified match(es) (score >= {:.2}). Injecting context.",
+                            qualified.len(), MIN_RETRIEVAL_SCORE));
 
                     context_code_str.push_str("\n--- RELEVANT EXISTING CONTEXT CODE ---\n");
                     for chunk in &qualified {
@@ -331,7 +397,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         current_prompt = construct_initial_prompt(&context_code_str, &original_task, &active_language);
     }
 
-    // ── Runtime config (Rust default; swap for multi-language) ───────────────
+    // ── Runtime config ────────────────────────────────────────────────────────
     let active_language = Language::Rust;
     let runtime_config  = RuntimeConfig::for_language(&active_language);
 
@@ -341,20 +407,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     const MAX_ATTEMPTS: usize = 5;
 
-    // ── Agent repair loop ─────────────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════════════════════
+    // AGENT REPAIR LOOP
+    // ═══════════════════════════════════════════════════════════════════════════
     while attempts < MAX_ATTEMPTS {
         if !resumed_session {
             attempts += 1;
         }
-        resumed_session = false; // Reset; next iteration is always a linear step
+        resumed_session = false;
 
-        log_event(
-            LogLevel::Info, "engine",
-            &format!(
-                "Transitioning State: [AgentState::Generating] (Attempt {}/{})",
-                attempts, MAX_ATTEMPTS
-            ),
-        );
+        log_event(LogLevel::Info, "engine",
+            &format!("Transitioning State: [AgentState::Generating] (Attempt {}/{})",
+                attempts, MAX_ATTEMPTS));
 
         let mut active_session = SessionState {
             task:           original_task.clone(),
@@ -369,7 +433,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let ai_response = match generate_with_retry(&client, &current_prompt).await {
             Ok(text) => text,
             Err(e) => {
-                log_event(LogLevel::Error, "network", &format!("Ollama call permanently failed: {}", e));
+                log_event(LogLevel::Error, "network",
+                    &format!("Ollama call permanently failed: {}", e));
                 active_session.current_state = AgentState::Failed;
                 active_session.last_error    = e.to_string();
                 let _ = save_session(&active_session);
@@ -377,57 +442,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         };
 
-        // ── Step 2: Sanitize ──────────────────────────────────────────────────
+        // ── Step 2: Parse multi-file blocks ───────────────────────────────────
         log_event(LogLevel::Info, "engine", "Transitioning State: [AgentState::Sanitizing]");
         active_session.current_state = AgentState::Sanitizing;
         let _ = save_session(&active_session);
 
-        let code_to_write = match sanitize_code(&ai_response) {
-            Some(code) => code,
-            None => {
-                log_event(
-                    LogLevel::Warn, "sanitizer",
-                    "Code block not captured in response. Re-prompting...",
-                );
-                current_prompt = format!(
-                    "Your previous response did not contain standard markdown code fences. \
-                     Please regenerate and wrap the code properly.\nTask: {}",
-                    original_task,
-                );
-                continue;
-            }
-        };
+        let parsed_files = parse_file_blocks(&ai_response);
+
+        if parsed_files.is_empty() {
+            // The model did not follow the tagging protocol at all. Re-prompt
+            // with an explicit reminder rather than entering the repair loop.
+            log_event(LogLevel::Warn, "parser",
+                "No <file path=\"...\"> blocks found in response. Re-prompting with format reminder.");
+
+            current_prompt = format!(
+                "Your previous response did not contain any valid <file path=\"...\"> blocks.\n\
+                 You MUST wrap every file inside <file path=\"relative/path\">contents</file> tags.\n\
+                 No markdown fences. No commentary outside the tags.\n\
+                 Re-generate now.\n\
+                 Task: {}",
+                original_task,
+            );
+            continue;
+        }
+
+        log_event(LogLevel::Info, "parser",
+            &format!("Parsed {} file block(s) from AI response.", parsed_files.len()));
+        for pf in &parsed_files {
+            log_event(LogLevel::Info, "parser",
+                &format!("  → '{}' ({} bytes)", pf.rel_path, pf.contents.len()));
+        }
 
         // ── Step 3: Security scan ─────────────────────────────────────────────
         log_event(LogLevel::Info, "engine", "Transitioning State: [AgentState::SecurityScanning]");
-        if !is_safe(&code_to_write) {
-            log_event(
-                LogLevel::Error, "security",
-                "Dangerous instruction sequence intercepted. Task terminated.",
-            );
+
+        if !scan_all_files(&parsed_files) {
+            log_event(LogLevel::Error, "security",
+                "Dangerous instruction sequence intercepted in generated file set. Task terminated.");
             active_session.current_state = AgentState::Failed;
             active_session.last_error    = "Security scan intercepted a rule infraction.".to_string();
             let _ = save_session(&active_session);
             break;
         }
 
-        // ── Step 4: File mapping ──────────────────────────────────────────────
-        // If an external workspace is active, map the code to its target path
-        // inside the project. If the AI supplied a `// TARGET_FILE:` hint, honour
-        // it; otherwise fall back to the scratchpad TARGET_FILE constant.
-        let target_hint = extract_target_file_hint(&ai_response);
+        // ── Step 4: Write files to disk ───────────────────────────────────────
+        // Determine the root directory to write into:
+        //   - Workspace mode  → the real project root supplied via CLI.
+        //   - Scratchpad mode → a fresh unique ephemeral job directory so that
+        //     multi-file scratchpad projects (e.g. Cargo.toml + src/main.rs)
+        //     are laid out exactly as the model intended.
+        let write_root: String = match &workspace_root {
+            Some(root) => root.clone(),
+            None       => {
+                let job_dir = get_unique_job_dir();
+                fs::create_dir_all(&job_dir).map_err(|e| {
+                    log_event(LogLevel::Error, "filesystem",
+                        &format!("Failed to create scratchpad job directory: {}", e));
+                    e
+                })?;
+                job_dir
+            }
+        };
 
-        let written_path = match write_code_to_target(
-            &code_to_write,
-            workspace_root.as_deref(),
-            target_hint.as_deref(),
-        ) {
-            Ok(p) => p,
+        let written_paths = match write_parsed_files(&parsed_files, &write_root) {
+            Ok(paths) => paths,
             Err(e) => {
-                log_event(
-                    LogLevel::Error, "filesystem",
-                    &format!("Failed to write generated code to target path: {}", e),
-                );
+                log_event(LogLevel::Error, "filesystem",
+                    &format!("File write failure: {}", e));
                 active_session.current_state = AgentState::Failed;
                 active_session.last_error    = e.to_string();
                 let _ = save_session(&active_session);
@@ -435,59 +516,87 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         };
 
-        log_event(
-            LogLevel::Info, "filesystem",
-            &format!("Code written → '{}'", written_path),
-        );
+        for path in &written_paths {
+            log_event(LogLevel::Info, "filesystem", &format!("Written → '{}'", path));
+        }
+
+        // Persist the tagged representation into the session so crash recovery
+        // can reconstruct the repair prompt with the original file set.
+        let files_repr = files_to_tagged_repr(&parsed_files);
+        active_session.generated_code = files_repr.clone();
 
         // ── Step 5: Compile / Check ───────────────────────────────────────────
-        log_event(
-            LogLevel::Info, "engine",
-            "Transitioning State: [AgentState::Compiling]",
-        );
-        active_session.current_state  = AgentState::Compiling;
-        active_session.generated_code = code_to_write.clone();
+        log_event(LogLevel::Info, "engine", "Transitioning State: [AgentState::Compiling]");
+        active_session.current_state = AgentState::Compiling;
         let _ = save_session(&active_session);
 
-        // Branch: workspace mode vs. scratchpad mode
-        let (check_ok, check_stderr) = match &workspace_root {
+        let (check_ok, check_stderr) = if workspace_root.is_some() {
             // ── Workspace mode ────────────────────────────────────────────────
-            Some(root) => {
-                log_event(
-                    LogLevel::Info, "compiler",
-                    &format!(
-                        "Workspace check: running `cargo check` inside container (project: {})",
-                        root
-                    ),
-                );
-                match run_workspace_check(root, &runtime_config, &active_language) {
+            // Detect the container-side manifest path from the written file set.
+            let manifest = find_container_manifest(&parsed_files, &active_language)
+                .unwrap_or_else(|| runtime_config.container_manifest_path(&active_language).to_string());
+
+            log_event(LogLevel::Info, "compiler",
+                &format!("Workspace check: cargo check (manifest: {})", manifest));
+
+            match run_workspace_check_at(&write_root, &runtime_config, &manifest) {
+                Ok(result) => result,
+                Err(e) => {
+                    log_event(LogLevel::Error, "compiler",
+                        &format!("Critical workspace check failure: {}", e));
+                    active_session.current_state = AgentState::Failed;
+                    active_session.last_error    = e.to_string();
+                    let _ = save_session(&active_session);
+                    break;
+                }
+            }
+        } else {
+            // ── Scratchpad mode ───────────────────────────────────────────────
+            // For a multi-file scratchpad (Cargo project), run `cargo check`
+            // inside the container against the job directory. For a bare single
+            // .rs file, fall back to `rustc`.
+            let has_cargo_toml = parsed_files.iter()
+                .any(|f| Path::new(&f.rel_path).file_name().map(|n| n == "Cargo.toml").unwrap_or(false));
+
+            if has_cargo_toml {
+                // Full Cargo project in scratchpad mode: use workspace check
+                // against the job dir which now contains the full layout.
+                // let manifest = format!("{}/Cargo.toml", write_root);
+                let container_manifest = "/workspace/Cargo.toml".to_string();
+
+                log_event(LogLevel::Info, "compiler",
+                    &format!("Scratchpad cargo check (job dir: {})", write_root));
+
+                match run_workspace_check_at(&write_root, &runtime_config, &container_manifest) {
                     Ok(result) => result,
                     Err(e) => {
-                        log_event(
-                            LogLevel::Error, "compiler",
-                            &format!("Critical workspace check engine failure: {}", e),
-                        );
+                        log_event(LogLevel::Error, "compiler",
+                            &format!("Critical scratchpad cargo check failure: {}", e));
                         active_session.current_state = AgentState::Failed;
                         active_session.last_error    = e.to_string();
                         let _ = save_session(&active_session);
+                        // Clean up orphaned job dir.
+                        compiler::safe_cleanup_job_dir(&write_root);
                         break;
                     }
                 }
-            }
-            // ── Scratchpad mode ───────────────────────────────────────────────
-            None => {
-                let job_dir = get_unique_job_dir();
-                log_event(
-                    LogLevel::Info, "compiler",
-                    &format!("Scratchpad compile inside ephemeral boundary: {}", job_dir),
-                );
-                match run_hardened_compile(&job_dir, &runtime_config, &written_path) {
+            } else {
+                // Single-file scratchpad: original rustc path.
+                // Find the primary source file (first .rs file in the set, or
+                // fall back to TARGET_FILE if none parsed).
+                let source_path = parsed_files.iter()
+                    .find(|f| f.rel_path.ends_with(&format!(".{}", runtime_config.source_extension)))
+                    .map(|f| format!("{}/{}", write_root, f.rel_path))
+                    .unwrap_or_else(|| TARGET_FILE.to_string());
+
+                log_event(LogLevel::Info, "compiler",
+                    &format!("Scratchpad single-file compile: {}", source_path));
+
+                match run_hardened_compile(&write_root, &runtime_config, &source_path) {
                     Ok(result) => result,
                     Err(e) => {
-                        log_event(
-                            LogLevel::Error, "compiler",
-                            &format!("Critical compile engine failure: {}", e),
-                        );
+                        log_event(LogLevel::Error, "compiler",
+                            &format!("Critical compile engine failure: {}", e));
                         active_session.current_state = AgentState::Failed;
                         active_session.last_error    = e.to_string();
                         let _ = save_session(&active_session);
@@ -498,79 +607,85 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         };
 
         if !check_ok {
-            // Compile / check failed → repair loop
             let clean_error = extract_clean_error(&check_stderr);
             log_event(LogLevel::Error, "compiler", "Check/compilation failed. Error details captured.");
             active_session.current_state = AgentState::Failed;
             active_session.last_error    = clean_error.clone();
             let _ = save_session(&active_session);
 
-            let error_type = if workspace_root.is_some() {
+            let error_type = if workspace_root.is_some() || parsed_files.iter().any(|f|
+                Path::new(&f.rel_path).file_name().map(|n| n == "Cargo.toml").unwrap_or(false))
+            {
                 "Cargo Check Error"
             } else {
                 "Compilation Error"
             };
 
+            // Pass the full tagged file repr into the repair prompt so the
+            // model can see which files it emitted and what broke.
             current_prompt = orchestrator::build_repair_prompt(
-                &original_task, &code_to_write, &clean_error, error_type,
+                &original_task, &files_repr, &clean_error, error_type,
             );
+            // Clean up the failed scratchpad job dir before the next attempt.
+            if workspace_root.is_none() {
+                compiler::safe_cleanup_job_dir(&write_root);
+            }
             continue;
         }
 
         // ── Step 6: Execute ───────────────────────────────────────────────────
-        log_event(
-            LogLevel::Info, "engine",
-            "Transitioning State: [AgentState::Executing] inside container boundary...",
-        );
+        log_event(LogLevel::Info, "engine",
+            "Transitioning State: [AgentState::Executing] inside container boundary...");
         active_session.current_state = AgentState::Executing;
         let _ = save_session(&active_session);
 
-        let exec_result = match &workspace_root {
-            Some(root) => {
-                log_event(
-                    LogLevel::Info, "sandbox",
-                    &format!("Workspace execution: mounting '{}' as /workspace", root),
-                );
-                run_workspace_execution(root, &runtime_config, &active_language)
-            }
-            None => {
-                // In scratchpad mode the job_dir was cleaned up by
-                // run_hardened_compile already; we need a fresh directory with
-                // the compiled binary. We re-compile here so the binary exists
-                // for the execution container — this is intentional: the two
-                // phases use separate ephemeral containers for isolation.
+        let exec_result = if workspace_root.is_some() {
+            // Workspace mode: mount and run.
+            log_event(LogLevel::Info, "sandbox",
+                &format!("Workspace execution: mounting '{}' as /workspace", write_root));
+            run_workspace_execution(&write_root, &runtime_config, &active_language)
+        } else {
+            let has_cargo = parsed_files.iter()
+                .any(|f| Path::new(&f.rel_path).file_name().map(|n| n == "Cargo.toml").unwrap_or(false));
+
+            if has_cargo {
+                // Multi-file scratchpad: use workspace execution against the
+                // job dir which contains the full Cargo layout.
+                log_event(LogLevel::Info, "sandbox",
+                    &format!("Multi-file scratchpad execution (job dir: {})", write_root));
+                run_workspace_execution(&write_root, &runtime_config, &active_language)
+            } else {
+                // Single-file scratchpad: re-compile into a fresh exec job dir,
+                // then run. Two separate containers for isolation.
                 let exec_job_dir = get_unique_job_dir();
-                log_event(
-                    LogLevel::Info, "sandbox",
-                    &format!("Scratchpad execution in ephemeral jail: {}", exec_job_dir),
-                );
-                // Re-compile into the new job dir (fast — binary already
-                // validated above; this just makes the artefact available).
-                if let Err(e) = run_hardened_compile(
-                    &exec_job_dir, &runtime_config, &written_path,
-                ) {
-                    log_event(
-                        LogLevel::Error, "compiler",
-                        &format!("Re-compile for execution stage failed: {}", e),
-                    );
+                log_event(LogLevel::Info, "sandbox",
+                    &format!("Single-file scratchpad execution (ephemeral jail: {})", exec_job_dir));
+
+                let source_path = parsed_files.iter()
+                    .find(|f| f.rel_path.ends_with(&format!(".{}", runtime_config.source_extension)))
+                    .map(|f| format!("{}/{}", write_root, f.rel_path))
+                    .unwrap_or_else(|| TARGET_FILE.to_string());
+
+                if let Err(e) = run_hardened_compile(&exec_job_dir, &runtime_config, &source_path) {
+                    log_event(LogLevel::Error, "compiler",
+                        &format!("Re-compile for execution stage failed: {}", e));
+                    compiler::safe_cleanup_job_dir(&write_root);
                     break;
                 }
+                // The check-phase job dir is no longer needed.
+                compiler::safe_cleanup_job_dir(&write_root);
                 run_hardened_execution(&exec_job_dir, &runtime_config)
             }
         };
 
         match exec_result {
             Ok(result) => {
-                log_event(
-                    LogLevel::Info, "telemetry",
-                    &format!(
-                        "duration={}ms stdout_bytes={} stderr_bytes={} exit_code={:?}",
+                log_event(LogLevel::Info, "telemetry",
+                    &format!("duration={}ms stdout_bytes={} stderr_bytes={} exit_code={:?}",
                         result.metrics.execution_duration_ms,
                         result.metrics.stdout_size,
                         result.metrics.stderr_size,
-                        result.metrics.exit_code,
-                    ),
-                );
+                        result.metrics.exit_code));
 
                 if result.timed_out {
                     log_event(LogLevel::Error, "sandbox", &result.stderr);
@@ -578,47 +693,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     active_session.last_error    = result.stderr.clone();
                     let _ = save_session(&active_session);
                     current_prompt = orchestrator::build_repair_prompt(
-                        &original_task, &code_to_write, &result.stderr, "Runtime Timeout Error",
-                    );
+                        &original_task, &files_repr, &result.stderr, "Runtime Timeout Error");
+
                 } else if result.limit_exceeded {
                     log_event(LogLevel::Error, "security", &result.stderr);
                     active_session.current_state = AgentState::Failed;
                     active_session.last_error    = result.stderr.clone();
                     let _ = save_session(&active_session);
                     current_prompt = orchestrator::build_repair_prompt(
-                        &original_task, &code_to_write, &result.stderr,
-                        "Host Pipe Bomb Exploitation Intercept",
-                    );
+                        &original_task, &files_repr, &result.stderr,
+                        "Host Pipe Bomb Exploitation Intercept");
+
                 } else if !result.stderr.is_empty() {
-                    log_event(
-                        LogLevel::Error, "sandbox",
-                        &format!("[Runtime Crash]\n{}", result.stderr),
-                    );
+                    log_event(LogLevel::Error, "sandbox",
+                        &format!("[Runtime Crash]\n{}", result.stderr));
                     active_session.current_state = AgentState::Failed;
                     active_session.last_error    = result.stderr.clone();
                     let _ = save_session(&active_session);
                     current_prompt = orchestrator::build_repair_prompt(
-                        &original_task, &code_to_write, &result.stderr, "Runtime Crash Error",
-                    );
+                        &original_task, &files_repr, &result.stderr, "Runtime Crash Error");
+
                 } else {
-                    log_event(
-                        LogLevel::Info, "engine",
-                        &format!("[Execution Pass]\n{}", result.stdout),
-                    );
-                    log_event(
-                        LogLevel::Info, "engine",
-                        "Transitioning State: [AgentState::Complete]. \
-                         Processing loop ended successfully.",
-                    );
-                    clear_session(); // Wipe persistence on clean success
+                    log_event(LogLevel::Info, "engine",
+                        &format!("[Execution Pass]\n{}", result.stdout));
+                    log_event(LogLevel::Info, "engine",
+                        "Transitioning State: [AgentState::Complete]. Processing loop ended successfully.");
+                    clear_session();
                     break;
                 }
             }
             Err(sandbox_err) => {
-                log_event(
-                    LogLevel::Error, "sandbox",
-                    &format!("Container execution failure: {}", sandbox_err),
-                );
+                log_event(LogLevel::Error, "sandbox",
+                    &format!("Container execution failure: {}", sandbox_err));
                 active_session.current_state = AgentState::Failed;
                 active_session.last_error    = sandbox_err.clone();
                 let _ = save_session(&active_session);

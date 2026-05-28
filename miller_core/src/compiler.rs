@@ -14,54 +14,31 @@ pub enum Language {
     Python,
 }
 
-/// Per-language runtime configuration. All Docker invocation details live here;
-/// nothing in the execution flow is allowed to hardcode language-specific strings.
+/// Per-language runtime configuration.
 ///
-/// Two distinct execution modes exist:
+/// Two execution modes:
 ///
-/// 1. **Scratchpad mode** (no external workspace): a single generated source file
-///    is copied into an ephemeral job directory, compiled with `compile_args`, and
-///    run with `run_args`. The `{INPUT}` / `{OUTPUT}` / `{BINARY}` placeholders
-///    resolve against that job directory.
-///
-/// 2. **Workspace mode** (external project path provided): the entire project
-///    directory is mounted at `/workspace` inside the container. The verification
-///    step runs `workspace_check_args` (e.g. `cargo check`) against the real
-///    project Cargo.toml. Execution is performed by running the binary produced
-///    inside the workspace, or the interpreter directly on the source.
+/// 1. **Scratchpad mode** — single generated source file compiled with
+///    `compile_args` and executed with `run_args`.
+/// 2. **Workspace mode** — full project directory mounted at `/workspace`;
+///    verified with `workspace_check_args`, run with `workspace_run_args`.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
-    /// Docker image for both compile/check and run phases.
     pub image_name: &'static str,
 
-    // ── Scratchpad-mode fields ──────────────────────────────────────────────
-
-    /// argv for the single-file compile step.
-    /// `None` means the language is interpreted (no compile phase in scratchpad mode).
+    // ── Scratchpad-mode fields ────────────────────────────────────────────────
+    /// `None` = interpreted language; no compile phase in scratchpad mode.
     /// Placeholders: `{INPUT}` → job_dir/main.<ext>, `{OUTPUT}` → job_dir/app
     pub compile_args: Option<Vec<&'static str>>,
-
-    /// argv for running the scratchpad binary / interpreter.
     /// Placeholders: `{BINARY}` → job_dir/app, `{INPUT}` → job_dir/main.<ext>
     pub run_args: Vec<&'static str>,
-
-    /// Source file extension used when writing into the scratchpad job directory.
     pub source_extension: &'static str,
 
-    // ── Workspace-mode fields ───────────────────────────────────────────────
-
-    /// argv for the workspace-level static check command run inside the container.
-    /// The container mounts the external project root at `/workspace`.
-    /// Placeholders: `{MANIFEST}` → language-specific project descriptor path,
+    // ── Workspace-mode fields ─────────────────────────────────────────────────
+    /// Placeholders: `{MANIFEST}` → container-side descriptor path,
     ///               `{WORKSPACE}` → `/workspace`
-    /// Example (Rust): `["cargo", "check", "--manifest-path", "{MANIFEST}"]`
-    /// Example (Python): `["python3", "-m", "py_compile", "{INPUT}"]` (per-file lint)
     pub workspace_check_args: Vec<&'static str>,
-
-    /// argv for running the project inside the workspace container.
-    /// Placeholder: `{WORKSPACE}` → `/workspace`
-    /// For Rust this typically invokes the compiled binary; for Python it runs the
-    /// entry-point script. Leave empty if verification-only (no run phase needed).
+    /// Placeholder: `{MANIFEST}` / `{WORKSPACE}` as above.
     pub workspace_run_args: Vec<&'static str>,
 }
 
@@ -70,26 +47,21 @@ impl RuntimeConfig {
         match lang {
             Language::Rust => RuntimeConfig {
                 image_name: "miller-rust-runner",
-                // Scratchpad: single rustc invocation
                 compile_args: Some(vec!["rustc", "{INPUT}", "-o", "{OUTPUT}"]),
                 run_args: vec!["{BINARY}"],
                 source_extension: "rs",
-                // Workspace: cargo check against real Cargo.toml
                 workspace_check_args: vec![
                     "cargo", "check", "--manifest-path", "{MANIFEST}",
                 ],
-                // Workspace run: execute the debug binary produced by cargo build
-                // Callers that want `cargo run` instead may swap this post-init.
                 workspace_run_args: vec![
                     "cargo", "run", "--manifest-path", "{MANIFEST}",
                 ],
             },
             Language::Python => RuntimeConfig {
                 image_name: "miller-python-runner",
-                compile_args: None, // interpreted — no scratchpad compile phase
+                compile_args: None,
                 run_args: vec!["python3", "{INPUT}"],
                 source_extension: "py",
-                // Workspace: syntax-check every changed file via py_compile
                 workspace_check_args: vec![
                     "python3", "-m", "py_compile", "{INPUT}",
                 ],
@@ -100,9 +72,8 @@ impl RuntimeConfig {
         }
     }
 
-    // ── Scratchpad resolution helpers ─────────────────────────────────────────
+    // ── Scratchpad resolution ─────────────────────────────────────────────────
 
-    /// Resolve compile argv against a concrete scratchpad job directory.
     pub fn resolved_compile_args(&self, job_dir: &str) -> Option<Vec<String>> {
         self.compile_args.as_ref().map(|args| {
             args.iter().map(|a| {
@@ -112,7 +83,6 @@ impl RuntimeConfig {
         })
     }
 
-    /// Resolve run argv against a concrete scratchpad job directory.
     pub fn resolved_run_args(&self, job_dir: &str) -> Vec<String> {
         self.run_args.iter().map(|a| {
             a.replace("{BINARY}", &format!("{}/app", job_dir))
@@ -120,12 +90,8 @@ impl RuntimeConfig {
         }).collect()
     }
 
-    // ── Workspace resolution helpers ──────────────────────────────────────────
+    // ── Workspace resolution ──────────────────────────────────────────────────
 
-    /// Resolve workspace check argv.
-    /// `workspace_container_root` is always `/workspace` (the Docker mount point).
-    /// `manifest_path` is the container-side path to the project descriptor
-    /// (e.g. `/workspace/Cargo.toml` for Rust, `/workspace/main.py` for Python).
     pub fn resolved_workspace_check_args(
         &self,
         manifest_path: &str,
@@ -138,7 +104,6 @@ impl RuntimeConfig {
         }).collect()
     }
 
-    /// Resolve workspace run argv.
     pub fn resolved_workspace_run_args(
         &self,
         manifest_path: &str,
@@ -150,8 +115,8 @@ impl RuntimeConfig {
         }).collect()
     }
 
-    /// Return the container-side path to the language-specific project descriptor.
-    /// For Rust this is `Cargo.toml`; for Python it is `main.py` (entry point).
+    /// Container-side path to the project descriptor.
+    /// Rust → `/workspace/Cargo.toml`; Python → `/workspace/main.py`
     pub fn container_manifest_path(&self, lang: &Language) -> &'static str {
         match lang {
             Language::Rust   => "/workspace/Cargo.toml",
@@ -162,38 +127,31 @@ impl RuntimeConfig {
 
 // ── Telemetry ─────────────────────────────────────────────────────────────────
 
-/// Structured metrics captured for every sandbox execution cycle.
 #[derive(Debug, Default)]
 pub struct SandboxMetrics {
-    /// Wall-clock time from container spawn to exit/kill, milliseconds.
     pub execution_duration_ms: u128,
-    /// Bytes captured on stdout (hard-capped at MAX_BUFFER_SIZE).
-    pub stdout_size: usize,
-    /// Bytes captured on stderr (hard-capped at MAX_BUFFER_SIZE).
-    pub stderr_size: usize,
-    /// Process exit code; `None` when the process was killed (timeout / limit).
-    pub exit_code: Option<i32>,
+    pub stdout_size:           usize,
+    pub stderr_size:           usize,
+    pub exit_code:             Option<i32>,
 }
 
 // ── Execution Result ──────────────────────────────────────────────────────────
 
 pub struct SandboxExecutionResult {
-    pub stdout: String,
-    pub stderr: String,
-    pub timed_out: bool,
+    pub stdout:        String,
+    pub stderr:        String,
+    pub timed_out:     bool,
     pub limit_exceeded: bool,
-    pub metrics: SandboxMetrics,
+    pub metrics:       SandboxMetrics,
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const MAX_BUFFER_SIZE: usize = 1024 * 1024; // 1 MB strict host-pipe ceiling
-/// Docker mount point for both workspace and scratchpad modes.
-const CONTAINER_WORKSPACE: &str = "/workspace";
+const MAX_BUFFER_SIZE:     usize = 1024 * 1024; // 1 MB
+const CONTAINER_WORKSPACE: &str  = "/workspace";
 
 // ── Job Directory Helpers ─────────────────────────────────────────────────────
 
-/// Generate a unique ephemeral job directory path per scratchpad execution.
 pub fn get_unique_job_dir() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -207,51 +165,45 @@ pub fn safe_cleanup_job_dir(job_dir: &str) {
         if fs::remove_dir_all(job_dir).is_ok() {
             return;
         }
-        // Cooling window for asynchronous container unmount
         std::thread::sleep(Duration::from_millis(100));
     }
     eprintln!("[Janitor warning] Permanent lock on resource directory: {}", job_dir);
 }
 
-// ── Shared Docker primitive ───────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// WORKSPACE MODE
+// ═══════════════════════════════════════════════════════════════════════════════
 
-/// Build the base `docker run` argv that is common to every invocation.
-/// The caller appends the volume mount(s) and the container command afterward.
+/// Workspace check — mounts `workspace_root` at `/workspace` and runs the
+/// language-native static checker.
+///
+/// This variant uses the **default** container manifest path derived from
+/// `RuntimeConfig::container_manifest_path` (e.g. `/workspace/Cargo.toml`).
+/// Use `run_workspace_check_at` when the multi-file parser has already
+/// confirmed a specific manifest location.
 #[allow(dead_code)]
-fn base_docker_args(image: &str, memory: &str, cpus: &str, pids: &str) -> Vec<String> {
-    vec![
-        "run".into(), "--rm".into(),
-        "--network".into(),      "none".into(),
-        "--memory".into(),       memory.into(),
-        "--cpus".into(),         cpus.into(),
-        "--pids-limit".into(),   pids.into(),
-        "--cap-drop".into(),     "ALL".into(),
-        "--security-opt".into(), "no-new-privileges".into(),
-        "-v".into(),             format!("{}:{}", CONTAINER_WORKSPACE, CONTAINER_WORKSPACE),
-        image.into(),
-    ]
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// WORKSPACE MODE — Full project mount + ecosystem tooling (cargo check, etc.)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// **Workspace check phase** — mounts the caller's project directory at
-/// `/workspace` and runs the language-native static checker (e.g. `cargo check`).
-///
-/// This replaces the single-file `rustc` compile in workspace mode.
-/// The function is deliberately pure: it does NOT write any file into the
-/// workspace; the caller is responsible for having already written the generated
-/// code to the correct path on the host before calling this.
-///
-/// Returns `(success, stderr_output)`.
 pub fn run_workspace_check(
     workspace_root: &str,
     config: &RuntimeConfig,
     lang: &Language,
 ) -> Result<(bool, String), std::io::Error> {
     let manifest = config.container_manifest_path(lang);
-    let check_argv = config.resolved_workspace_check_args(manifest, CONTAINER_WORKSPACE);
+    run_workspace_check_at(workspace_root, config, manifest)
+}
+
+/// Workspace check with an **explicit** container-side manifest path.
+///
+/// Called by main.rs after the multi-file parser has written files and can
+/// confirm that `Cargo.toml` exists at a known location (always
+/// `/workspace/Cargo.toml` for a properly generated Rust project).
+/// Separating this from the default variant keeps the caller in full control
+/// of the manifest path without requiring a mutable `RuntimeConfig`.
+pub fn run_workspace_check_at(
+    workspace_root: &str,
+    config: &RuntimeConfig,
+    manifest_path: &str,
+) -> Result<(bool, String), std::io::Error> {
+    let check_argv = config.resolved_workspace_check_args(manifest_path, CONTAINER_WORKSPACE);
 
     let output = Command::new("docker")
         .args(&[
@@ -262,7 +214,6 @@ pub fn run_workspace_check(
             "--pids-limit",   "100",
             "--cap-drop",     "ALL",
             "--security-opt", "no-new-privileges",
-            // Mount the real project root read-write so cargo's target/ dir can be written.
             "-v", &format!("{}:{}:rw", workspace_root, CONTAINER_WORKSPACE),
             config.image_name,
         ])
@@ -273,20 +224,16 @@ pub fn run_workspace_check(
     Ok((output.status.success(), stderr))
 }
 
-/// **Workspace execution phase** — runs the project binary (or interpreter) from
-/// inside a sandboxed container with the project directory mounted read-write.
-/// The container gets a writable `/tmp` tmpfs for any build artefacts.
-///
-/// A read-only flag is intentionally NOT applied here because `cargo run`
-/// requires writing to `target/` inside the workspace.
+/// Workspace execution — runs the project from inside the container.
+/// `read-only` is intentionally absent: `cargo run` writes to `target/`.
 pub fn run_workspace_execution(
     workspace_root: &str,
     config: &RuntimeConfig,
     lang: &Language,
 ) -> Result<SandboxExecutionResult, String> {
-    let manifest  = config.container_manifest_path(lang);
-    let run_argv  = config.resolved_workspace_run_args(manifest, CONTAINER_WORKSPACE);
-    let start     = Instant::now();
+    let manifest = config.container_manifest_path(lang);
+    let run_argv = config.resolved_workspace_run_args(manifest, CONTAINER_WORKSPACE);
+    let start    = Instant::now();
 
     let child = match Command::new("docker")
         .args(&[
@@ -315,14 +262,11 @@ pub fn run_workspace_execution(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// SCRATCHPAD MODE — Ephemeral single-file compile + execute
+// SCRATCHPAD MODE
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// **Scratchpad compile phase** — copies `source_file_on_host` into `job_dir`,
-/// then compiles it with the language-native single-file compiler (e.g. `rustc`).
-/// For interpreted languages the copy still happens but no compile is run.
-///
-/// Returns `(success, stderr_output)`.
+/// Scratchpad compile — copies `source_file_on_host` into `job_dir` and
+/// compiles it. Interpreted languages skip the compile step.
 pub fn run_hardened_compile(
     job_dir: &str,
     config: &RuntimeConfig,
@@ -339,7 +283,6 @@ pub fn run_hardened_compile(
         return Ok((false, format!("{} missing on host cache", source_file_on_host)));
     }
 
-    // Interpreted languages have no compile phase.
     let compile_argv = match config.resolved_compile_args(job_dir) {
         Some(args) => args,
         None       => return Ok((true, String::new())),
@@ -364,15 +307,14 @@ pub fn run_hardened_compile(
     Ok((output.status.success(), stderr))
 }
 
-/// **Scratchpad execution phase** — runs the compiled binary (or interpreter)
-/// from inside a read-only ephemeral jail. The job directory is cleaned up
-/// after exit regardless of outcome.
+/// Scratchpad execution — runs the compiled binary in a read-only ephemeral
+/// jail. Cleans up `job_dir` on exit.
 pub fn run_hardened_execution(
     job_dir: &str,
     config: &RuntimeConfig,
 ) -> Result<SandboxExecutionResult, String> {
-    let run_argv  = config.resolved_run_args(job_dir);
-    let start     = Instant::now();
+    let run_argv = config.resolved_run_args(job_dir);
+    let start    = Instant::now();
 
     let child = match Command::new("docker")
         .args(&[
@@ -401,18 +343,13 @@ pub fn run_hardened_execution(
         }
     };
 
-    // Scratchpad mode cleans up the ephemeral job directory after execution.
     stream_child_output(child, start, Some(job_dir))
 }
 
-// ── Shared streaming / watchdog ───────────────────────────────────────────────
+// ── Shared streaming watchdog ─────────────────────────────────────────────────
 
-/// Poll a child process, stream its stdout/stderr with bounded buffers and a
-/// hard timeout, then return a `SandboxExecutionResult`.
-///
-/// `cleanup_dir` — if `Some(path)`, the directory is removed after the process
-/// exits (scratchpad mode). Pass `None` for workspace mode where the mount is
-/// managed by Docker itself.
+/// Poll a child process with bounded buffers and a hard timeout.
+/// `cleanup_dir` — `Some(path)` removes the directory after exit (scratchpad).
 fn stream_child_output(
     mut child: std::process::Child,
     start_time: Instant,
@@ -423,11 +360,11 @@ fn stream_child_output(
     let mut stderr_pipe = child.stderr.take()
         .ok_or("Failed to capture stderr pipe")?;
 
-    let timeout_duration = Duration::from_secs(30); // Generous for cargo build
+    let timeout_duration = Duration::from_secs(120); // generous for `cargo run`
 
-    let mut stdout_buf   = Vec::new();
-    let mut stderr_buf   = Vec::new();
-    let mut chunk        = [0u8; 4096];
+    let mut stdout_buf     = Vec::new();
+    let mut stderr_buf     = Vec::new();
+    let mut chunk          = [0u8; 4096];
     let mut limit_exceeded = false;
     let mut timed_out      = false;
     let mut exit_code: Option<i32> = None;
@@ -494,7 +431,7 @@ fn stream_child_output(
 
     if limit_exceeded {
         clean_stderr.push_str(
-            "\n[SECURITY ALERT] HOST PIPE BOMB BLOCKED: Execution terminated. \
+            "\n[SECURITY ALERT] HOST PIPE BOMB BLOCKED: \
              Stdout/Stderr threshold of 1 MB breached.",
         );
     }
@@ -527,7 +464,7 @@ pub fn extract_clean_error(raw_stderr: &str) -> String {
                 || line.contains("help:")
                 || line.contains("note:")
         })
-        .take(40) // Wider window for cargo check output which is more verbose
+        .take(40)
         .collect::<Vec<_>>()
         .join("\n")
 }
